@@ -7,7 +7,7 @@
     # caos build/agent daemon + CLI. Brings its own pinned nixpkgs (rust-overlay
     # + crane); left un-followed on purpose so its Rust workspace substitutes
     # from cache rather than rebuilding against ours.
-    caos.url = "github:Metta-AI/caos";
+    caos.url = "github:softmax-universe/caos";
 
     # Nimby is the project's dependency manager (see README / Dockerfile). It is
     # a single-file, stdlib-only Nim program, so we build it from source instead

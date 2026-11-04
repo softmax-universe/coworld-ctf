@@ -36,7 +36,7 @@ env vars. One screen, each line pointing at where it is proven:
   seat calls plays by name instead, never this mask): bit0 Up=1, bit1
   Down=2, bit2 Left=4, bit3 Right=8, bit4 Select=16, bit5 A=32, bit6 B=64 —
   inherited wholesale from the
-  [Sprite v1 base spec](https://github.com/Metta-AI/bitworld/blob/master/docs/sprite_v1.md),
+  [Sprite v1 base spec](https://github.com/softmax-universe/bitworld/blob/master/docs/sprite_v1.md),
   not redefined in this repo — and bit7 C=128, this repo's own extension (see
   "Player input: bit 7 is the C button" below, this file, and
   `players/baseline/baseline.nim:150`).
@@ -50,7 +50,7 @@ env vars. One screen, each line pointing at where it is proven:
 
 Both the player endpoints (`/player`, POV observation streams) and the
 global/spectator endpoint speak
-[Sprite v1](https://github.com/Metta-AI/bitworld/blob/master/docs/sprite_v1.md).
+[Sprite v1](https://github.com/softmax-universe/bitworld/blob/master/docs/sprite_v1.md).
 This document lists everything CTF adds or changes relative to that base
 document; anything not mentioned here matches Sprite v1 exactly. Game
 semantics — mechanics, sprite labels, tuning defaults — live in

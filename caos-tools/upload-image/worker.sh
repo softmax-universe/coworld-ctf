@@ -9,7 +9,7 @@
 #           DELTA, and take back the ref it converted to
 #   push    the platform conversation: request, push, complete, register
 #
-# WHY THE SERVER CONVERTS AND WE JUST ASK. `caos resolve-image` (Metta-AI/caos
+# WHY THE SERVER CONVERTS AND WE JUST ASK. `caos resolve-image` (softmax-universe/caos
 # #148, added for this) returns the ref the server already computed and cached
 # for a git-docker tree. This stage used to do the convert itself — pull the
 # base with skopeo, tar layer00, append its diff_id to the config and its

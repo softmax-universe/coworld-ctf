@@ -14,7 +14,7 @@ enemy heart and carry it home — or eliminate the enemy team — to win. Vision
 fog-of-war: the map is always visible, but enemies only appear inside your
 forward vision cone or your small omnidirectional bubble.
 
-It is a fork of [Crewrift](https://github.com/Metta-AI/coworld-crewrift): it keeps
+It is a fork of [Crewrift](https://github.com/softmax-universe/coworld-crewrift): it keeps
 Crewrift's continuous 2D movement, line-of-sight, sprite protocol, server, and
 replay infrastructure, and replaces the social-deduction game layer (roles,
 tasks, voting) with teams, guns, hearts, and fog-of-war vision.

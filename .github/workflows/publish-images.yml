@@ -3,14 +3,14 @@ name: Publish images
 # Builds and pushes the game and baseline-bot images to GHCR.
 # Manual (workflow_dispatch) or on a version tag, so ordinary pushes to main
 # do not republish images. The manifest references:
-#   ghcr.io/metta-ai/coworld-ctf           (game)
-#   ghcr.io/metta-ai/coworld-ctf-baseline  (baseline bot)
+#   ghcr.io/softmax-universe/coworld-ctf           (game)
+#   ghcr.io/softmax-universe/coworld-ctf-baseline  (baseline bot)
 #
 # The `bases` job below publishes the two nix-built bases the baseline bot's
 # Dockerfile sits on. It runs FIRST and `publish` needs it, because a base that
 # does not exist in GHCR is a Dockerfile that cannot resolve its FROM.
-#   ghcr.io/metta-ai/coworld-ctf-nim       (build stage: nim + nimby + ccache)
-#   ghcr.io/metta-ai/coworld-ctf-runtime   (runtime: glibc + curl + cacert)
+#   ghcr.io/softmax-universe/coworld-ctf-nim       (build stage: nim + nimby + ccache)
+#   ghcr.io/softmax-universe/coworld-ctf-runtime   (runtime: glibc + curl + cacert)
 #
 # THEY ARE TAGGED BY THEIR NIXPKGS PIN, not `latest`, and the Dockerfile names
 # that tag explicitly. The tag IS the contract: nim bakes absolute /nix/store
@@ -98,7 +98,7 @@ jobs:
           for tag in "${{ steps.pin.outputs.tag }}" latest; do
             skopeo copy --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
               "docker-archive:$archive" \
-              "docker://ghcr.io/metta-ai/${{ matrix.image }}:$tag"
+              "docker://ghcr.io/softmax-universe/${{ matrix.image }}:$tag"
           done
 
   publish:
@@ -130,7 +130,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/metta-ai/${{ matrix.image }}
+          images: ghcr.io/softmax-universe/${{ matrix.image }}
           tags: |
             type=raw,value=latest
             type=ref,event=tag
