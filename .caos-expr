@@ -16,5 +16,5 @@
 # a root-level DEEP-DEPS/bash, and since tools carry their own expression they
 # name their own image themselves. A root entry would be dead weight that reads
 # like a contract.
-MOUNTED=run --base:@@=git+https://github.com/Metta-AI/caos?rev=d21701e1f9628f56824294d61bb6163945fe12b7&dir=std/flake-input-loader --input-tree:@@=git+https://github.com/Metta-AI/caos?rev=d21701e1f9628f56824294d61bb6163945fe12b7&dir=std --input=caos --in:@=. --expr=$CAOS_EXPR --output-path=caos-std
-run --base:@@=git+https://github.com/Metta-AI/caos?rev=d21701e1f9628f56824294d61bb6163945fe12b7&dir=std/deep-deps --in=$MOUNTED
+MOUNTED=run --base:@@=git+https://github.com/softmax-universe/caos?rev=d21701e1f9628f56824294d61bb6163945fe12b7&dir=std/flake-input-loader --input-tree:@@=git+https://github.com/softmax-universe/caos?rev=d21701e1f9628f56824294d61bb6163945fe12b7&dir=std --input=caos --in:@=. --expr=$CAOS_EXPR --output-path=caos-std
+run --base:@@=git+https://github.com/softmax-universe/caos?rev=d21701e1f9628f56824294d61bb6163945fe12b7&dir=std/deep-deps --in=$MOUNTED

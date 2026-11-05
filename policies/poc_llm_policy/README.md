@@ -212,7 +212,7 @@ Rosetta or `export DOCKER_DEFAULT_PLATFORM=linux/amd64`, or the CLI itself
 warns on every local run (verified, `coworld==0.1.46`): "linux/amd64-only
 Coworld images will run on Apple Silicon, but DOCKER_DEFAULT_PLATFORM is not
 set to linux/amd64" (setup:
-<https://github.com/Metta-AI/coworld/blob/main/src/coworld/docs/MACOS.md>).
+<https://github.com/softmax-universe/coworld/blob/main/src/coworld/docs/MACOS.md>).
 
 **In a hosted tournament you pass no key at all.** The platform injects the
 sidecar environment into the pod, the harness detects

@@ -101,7 +101,7 @@ It is **not yet wired into CI** — that needs a human, because cubi tokens lack
 GitHub's `workflows` permission and a bot cannot modify `.github/workflows/`.
 To wire it up, add this to the `build` job in
 `.github/workflows/build.yml` (details:
-https://github.com/Metta-AI/coworld-ctf/issues/268 — cite full URLs here, not a
+https://github.com/softmax-universe/coworld-ctf/issues/268 — cite full URLs here, not a
 bare `#N`: softmax runs both GitHub and Forgejo with independently numbered
 issues, so a bare number resolves against whichever host the reader is on):
 
@@ -142,7 +142,7 @@ instead of blending in.
 - `src/ctf/map_pool.nim` — GENERATED curated terrain-pool seeds; rewrite it
   only via `tools/gen_map_pool.nim`, never by hand.
 - Paintball King of the Hill — a deprecated config-gated squad mode merged
-  back from Metta-AI/cogame-paintball (docs/paintball/: RULES, PROTOCOL,
+  back from softmax-universe/cogame-paintball (docs/paintball/: RULES, PROTOCOL,
   COMMANDING, the design note). Since 0.7.253 live boot requires
   `allowDeprecatedModes: true`, and the published manifest no longer offers a
   paintball variant. Mode modules remain in `src/ctf/`: `paint.nim` (paint grid + hill),
@@ -338,7 +338,7 @@ about it. What a player's feet are on is the 96px pedestal disc.
 The other five pickups (grenade, med kit, shield, spray can, barrier) still
 use 12px against 18-26px sprites — a milder version of the same mismatch (at
 worst ~2x, vs the heart's 5x), deliberately left alone by GV42's scope. Filed
-as https://github.com/Metta-AI/coworld-ctf/issues/266 with the measurements.
+as https://github.com/softmax-universe/coworld-ctf/issues/266 with the measurements.
 
 ## Terrain
 

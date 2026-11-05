@@ -27,7 +27,7 @@ fail() { echo "BUILD-IMAGE FAIL: $*" >&2; exit 1; }
 # The runtime base the Dockerfile names. Kept in step with it BY HAND, which is
 # the coupling this repo chose to make visible rather than clever: the tag is
 # the nixpkgs pin, and a mismatch dies loudly at startup rather than silently.
-DEFAULT_RUNTIME=ghcr.io/metta-ai/coworld-ctf-runtime:b47ad65d
+DEFAULT_RUNTIME=ghcr.io/softmax-universe/coworld-ctf-runtime:b47ad65d
 
 stage=narrow
 if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
