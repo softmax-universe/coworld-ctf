@@ -394,7 +394,7 @@ proc rotatingDiamondPixels*(
   ## `pixels` are rasterized at scale× that footprint — the analytic mask is
   ## evaluated per output pixel, so a scaled frame has genuinely smoother
   ## edges, not upscaled blocks.
-  let size = 2 * radius + 8
+  let size = rotatingDiamondSize(radius)
   let index = diamondFrameIndex(frame)
   for cached in diamondFrameCache[index]:
     if cached.scale == scale:

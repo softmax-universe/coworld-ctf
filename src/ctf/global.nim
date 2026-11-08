@@ -1,7 +1,8 @@
 import
-  std/[algorithm, heapqueue, math, os, strutils, tables, times],
+  std/[algorithm, heapqueue, math, os, sets, strutils, tables, times],
   supersnappy,
   bitworld/pixelfonts, bitworld/profile, bitworld/spriteprotocol, bitworld/server,
+  flatty/binny,
   pixie,
   labels, sim
 
@@ -1324,6 +1325,11 @@ type
                                  ## another player's drive state.
     cogDriveTick*: int           ## sim.tickCount at the last cogDrive step;
                                  ## see GlobalViewerState.cogDriveTick.
+    idStamp: seq[int32]        ## delete sweep: idStamp[id] == idGen marks id
+                               ## live this frame; grows to the largest pool
+                               ## id this viewer emits (~40k ids ≈ 160 KB)
+    idGen: int32               ## replaces a per-frame scan of the id seq,
+                               ## quadratic in the object count
 
   ProtocolTextItem = ref object
     spriteId: int
@@ -2121,11 +2127,23 @@ proc addBoardObject(
   ## addObject for renderer emissions: placements on the zoomable board
   ## layers (map + fog) scale by boardScale; UI-layer placements pass
   ## through untouched. z is ordering-only and never scales.
-  if layerId == MapLayerId or layerId == FogLayerId:
-    packet.addObject(
-      objectId, x * boardScale, y * boardScale, z, layerId, spriteId)
-  else:
-    packet.addObject(objectId, x, y, z, layerId, spriteId)
+  ##
+  ## Encoded here in one setLen + inline binny stores rather than through
+  ## addObject: that path is six cross-module calls with a setLen each, and
+  ## every emitter pays it for every object it re-places every frame. binny's
+  ## writers are the same copyMem the addObject path bottoms out in, so the
+  ## bytes are identical, as are the conversion checks.
+  let
+    board = layerId == MapLayerId or layerId == FogLayerId
+    start = packet.len
+  packet.setLen(start + 12)
+  packet[start] = SpriteMessageObject
+  packet.writeUint16(start + 1, uint16(objectId))
+  packet.writeInt16(start + 3, int16(if board: x * boardScale else: x))
+  packet.writeInt16(start + 5, int16(if board: y * boardScale else: y))
+  packet.writeInt16(start + 7, int16(z))
+  packet[start + 9] = uint8(layerId)
+  packet.writeUint16(start + 10, uint16(spriteId))
 
 proc addBoardSpriteChanged(
   packet: var seq[uint8],
@@ -8023,7 +8041,9 @@ proc buildSpriteProtocolPlayerUpdates*(
     result = sim.buildSpriteProtocolPlayerInit(nextState.spriteDefs, spritesOff)
     nextState.initialized = true
 
-  var currentIds: seq[int] = @[]
+  # Sized to last frame's object count: the id list runs to ~300 entries and
+  # was regrown from nothing every frame.
+  var currentIds = newSeqOfCap[int](nextState.objectIds.len + 32)
   if sim.phase != Playing or playerIndex < 0 or
       playerIndex >= sim.players.len:
     currentIds.add(SpritePlayerInterstitialObjectId)
@@ -8216,18 +8236,26 @@ proc buildSpriteProtocolPlayerUpdates*(
         # the rig branch above.)
         let rot = soldierRotIndex(other.aimBrads)
         spriteId = selfSoldierSpriteId(other.skin, rot)
-        result.addSpriteChanged(
-          nextState.spriteDefs,
-          spriteId,
-          SoldierCanvas,
-          SoldierCanvas,
-          soldierOutlined(soldierRotPixels(other.team, other.skin, rot), 2'u8),
-          # Documented self marker (RULES.md): `self <color> <side>`, only drawn
-          # while alive. Side follows the aim exactly as the sim's flipH does.
-          labelSelf(
-            teamText(other.team),
-            if soldierFacingRight(rot): LabelSideRight else: LabelSideLeft)
-        )
+        # The def is immutable per (skin, rot), so only rasterize the outline
+        # the first time this viewer needs it — addSpriteChanged would drop a
+        # re-send anyway, after paying for the pixels. "Immutable" leans on
+        # the team: the pixels and the label both read other.team, which the
+        # sprite id does NOT encode — it holds only because addPlayer assigns
+        # team once. If mid-episode team switching ever lands, this gate must
+        # compare the label too.
+        if nextState.spriteDefs.spriteDefinitionIndex(spriteId) < 0:
+          result.addSpriteChanged(
+            nextState.spriteDefs,
+            spriteId,
+            SoldierCanvas,
+            SoldierCanvas,
+            soldierOutlined(soldierRotPixels(other.team, other.skin, rot), 2'u8),
+            # Documented self marker (RULES.md): `self <color> <side>`, only drawn
+            # while alive. Side follows the aim exactly as the sim's flipH does.
+            labelSelf(
+              teamText(other.team),
+              if soldierFacingRight(rot): LabelSideRight else: LabelSideLeft)
+          )
       let objectId = other.spriteObjectId()
       currentIds.add(objectId)
       result.addBoardObject(
@@ -8597,8 +8625,20 @@ proc buildSpriteProtocolPlayerUpdates*(
     nextState.spriteDefs, currentIds, result, spritesOff = spritesOff)
 
   if not state.isNil:
+    # Membership via a generation stamp per object id: `notin` over the id
+    # seq was quadratic in the object count, which fog runs push into the
+    # hundreds. Ids are u16 on the wire, so the stamp array is small and
+    # grown once; a stamp equal to this frame's generation marks the id
+    # live, everything else is stale.
+    inc nextState.idGen
+    let gen = nextState.idGen
+    for objectId in currentIds:
+      if objectId >= nextState.idStamp.len:
+        nextState.idStamp.setLen(objectId + 1)
+      nextState.idStamp[objectId] = gen
     for objectId in state.objectIds:
-      if objectId notin currentIds:
+      if objectId >= nextState.idStamp.len or
+          nextState.idStamp[objectId] != gen:
         result.addDeleteObject(objectId)
   nextState.objectIds = currentIds
 
@@ -9349,6 +9389,9 @@ proc buildSpriteProtocolUpdates*(
       replayMismatchSameBuild
     )
     if not povClearsObjects:
+      # Deliberately still the notin scan: this lens is one spectator, not
+      # 16 seats, and its pool includes addDebugOverlay's payload-derived
+      # ids, which must not size a stamp array.
       for objectId in state.objectIds:
         if objectId notin currentIds:
           result.addDeleteObject(objectId)
@@ -9697,8 +9740,11 @@ proc buildSpriteProtocolUpdates*(
   if sim.teams().len <= 4:
     sim.addTeamScoreboard(nextState.spriteDefs, currentIds, result)
 
+  # One HashSet per frame instead of a `notin` seq scan per id, which was
+  # quadratic in the object count.
+  let current = currentIds.toHashSet
   for objectId in state.objectIds:
-    if objectId notin currentIds:
+    if objectId notin current:
       result.addDeleteObject(objectId)
   nextState.objectIds = currentIds
 

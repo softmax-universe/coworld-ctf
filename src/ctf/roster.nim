@@ -51,13 +51,11 @@ proc teamForSlot*(sim: SimServer, order: int): Team =
   ## Returns the configured or default team for one slot: slots deal round
   ## the active teams in enum order (the classic red/blue alternation on
   ## 2-team maps).
-  let slot =
-    if order >= 0 and order < sim.config.slots.len:
-      sim.config.slots[order]
-    else:
-      PlayerSlotConfig()
-  if slot.hasTeam:
-    slot.team
+  # read the fields in place: binding the slot copied its two string fields,
+  # and slotIdentityIndex fans this out O(order) times per badge
+  if order >= 0 and order < sim.config.slots.len and
+      sim.config.slots[order].hasTeam:
+    sim.config.slots[order].team
   else:
     Team(order mod sim.gameMap.teamCount())
 
