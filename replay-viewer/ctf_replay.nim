@@ -6,6 +6,7 @@ import
 var
   runtimeLoaded = false
   pendingSeekTick = -1
+  pendingPlay = false
   replay: ReplayPlayer
   game: SimServer
   viewer: GlobalViewerState
@@ -234,11 +235,15 @@ proc ctfFrame(): cint {.exportc: "ctf_frame", cdecl.} =
     if pendingSeekTick >= 0:
       seekTicks = @[pendingSeekTick]
       pendingSeekTick = -1
+    var commands = viewer.replayCommands
+    if pendingPlay:
+      commands.add('p')
+      pendingPlay = false
     let events = replay.advanceReplayFrame(
       game,
       tracker,
       seekTicks,
-      viewer.replayCommands
+      commands
     )
     renderCurrent(events)
     return 1
@@ -274,6 +279,10 @@ proc ctfEmbeddedKeyframes(): cint {.exportc: "ctf_embedded_keyframes", cdecl.} =
 
 proc ctfSeek(tick: cint) {.exportc: "ctf_seek", cdecl.} =
   pendingSeekTick = int(tick)
+
+proc ctfPlay() {.exportc: "ctf_play", cdecl.} =
+  ## A seek pauses playback; this resumes it on the next frame.
+  pendingPlay = true
 
 proc ctfTick(): cint {.exportc: "ctf_tick", cdecl.} =
   if runtimeLoaded: cint(game.tickCount) else: -1

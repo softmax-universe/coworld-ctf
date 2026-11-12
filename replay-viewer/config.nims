@@ -50,6 +50,6 @@ switch(
   -s FILESYSTEM=1
   -s ENVIRONMENT=web,worker,node
   -s EXPORTED_RUNTIME_METHODS=HEAPU8
-  -s EXPORTED_FUNCTIONS=_main,_malloc,_free,_ctf_load_replay,_ctf_frame,_ctf_input,_ctf_packet_ptr,_ctf_packet_len,_ctf_mismatch_tick,_ctf_error_ptr,_ctf_error_len,_ctf_calls_ptr,_ctf_calls_len,_ctf_stage_ptr,_ctf_stage_len,_ctf_game_version_ptr,_ctf_game_version_len,_ctf_sim_sources_stamp_ptr,_ctf_sim_sources_stamp_len,_ctf_embedded_keyframes,_ctf_seek,_ctf_tick
+  -s EXPORTED_FUNCTIONS=_main,_malloc,_free,_ctf_load_replay,_ctf_frame,_ctf_input,_ctf_packet_ptr,_ctf_packet_len,_ctf_mismatch_tick,_ctf_error_ptr,_ctf_error_len,_ctf_calls_ptr,_ctf_calls_len,_ctf_stage_ptr,_ctf_stage_len,_ctf_game_version_ptr,_ctf_game_version_len,_ctf_sim_sources_stamp_ptr,_ctf_sim_sources_stamp_len,_ctf_embedded_keyframes,_ctf_seek,_ctf_play,_ctf_tick
   """).replace("\n", " ")
 )

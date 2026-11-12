@@ -70,7 +70,17 @@ proc toPortable*(s: var string, x: uint64) = s.addUint64(x)
 proc toPortable*(s: var string, x: int64) = s.addInt64(x)
 proc toPortable*(s: var string, x: float32) = s.addFloat32(x)
 proc toPortable*(s: var string, x: float64) = s.addFloat64(x)
-proc toPortable*(s: var string, x: int) = s.addInt64(int64(x))
+proc toPortable*(s: var string, x: int) =
+  when sizeof(int) == 4:
+    # The inverse of fromPortable's sentinel mapping: a 32-bit engine writes
+    # its pointer-width-relative sentinels at 64-bit scale.
+    if x == low(int): s.addInt64(low(int64))
+    elif x == high(int): s.addInt64(high(int64))
+    elif x == low(int) div 2: s.addInt64(low(int64) div 2)
+    elif x == high(int) div 2: s.addInt64(high(int64) div 2)
+    else: s.addInt64(int64(x))
+  else:
+    s.addInt64(int64(x))
 proc toPortable*(s: var string, x: uint) = s.addUint64(uint64(x))
 
 proc fromPortable*(s: string, i: var int, x: var bool) =
@@ -104,8 +114,20 @@ proc fromPortable*(s: string, i: var int, x: var int) =
   i += 8
   when sizeof(int) == 4:
     if wide < int64(low(int32)) or wide > int64(high(int32)):
-      raise newException(PortableFlattyError,
-        "portable int does not fit this target's 32-bit int")
+      # Pointer-width-relative sentinels (`low(int) div 2` as "never",
+      # `high(int)` as "unbounded", ...) are written by a 64-bit engine at
+      # 64-bit scale; map them to the same sentinel at this target's scale.
+      # The sim's own init on wasm32 produces exactly these values, so the
+      # restored state matches a wasm32 walk. Any other wide value is real
+      # data that cannot be narrowed.
+      if wide == low(int64): x = low(int)
+      elif wide == high(int64): x = high(int)
+      elif wide == low(int64) div 2: x = low(int) div 2
+      elif wide == high(int64) div 2: x = high(int) div 2
+      else:
+        raise newException(PortableFlattyError,
+          "portable int does not fit this target's 32-bit int")
+      return
   x = int(wide)
 
 proc fromPortable*(s: string, i: var int, x: var uint) =

@@ -43,7 +43,7 @@ function errorText() {
 }
 
 function run() {
-  for (const name of ['_ctf_embedded_keyframes', '_ctf_seek', '_ctf_tick']) {
+  for (const name of ['_ctf_embedded_keyframes', '_ctf_seek', '_ctf_play', '_ctf_tick']) {
     if (typeof Module[name] !== 'function') {
       console.error('FAIL: bundle predates the checkpoint exports (' + name + ' missing); rebuild it');
       process.exit(1);
@@ -77,8 +77,20 @@ function run() {
     console.error('FAIL: seek did not land exactly, or the restored sim diverged');
     process.exit(1);
   }
+  Module._ctf_play();
   let frames = 0;
-  while (Module._ctf_frame() === 1 && frames < 20000) frames++;
+  let previous = landed;
+  let stalled = 0;
+  while (Module._ctf_frame() === 1 && frames < 200000) {
+    frames++;
+    const now = Module._ctf_tick();
+    if (now === previous) {
+      if (++stalled > 600) break; // paused at the end hold
+    } else {
+      stalled = 0;
+      previous = now;
+    }
+  }
   if (Module._ctf_error_len()) {
     console.error('FAIL: playback died after the seek\n' + errorText());
     process.exit(1);
@@ -87,8 +99,13 @@ function run() {
     console.error('FAIL: hash mismatch at tick ' + Module._ctf_mismatch_tick() + ' after the seek');
     process.exit(1);
   }
+  const finalTick = Module._ctf_tick();
+  if (finalTick <= landed) {
+    console.error('FAIL: playback did not advance past the seek (tick ' + finalTick + ')');
+    process.exit(1);
+  }
   clearTimeout(watchdog);
-  console.log('ok: played ' + frames + ' frames from the seek to tick ' + Module._ctf_tick() +
+  console.log('ok: played ' + frames + ' frames from tick ' + landed + ' to tick ' + finalTick +
     ' with no hash mismatch');
   process.exit(0);
 }
