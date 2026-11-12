@@ -6,6 +6,7 @@ import
   bitworld/runtime,
   curly, mummy,
   sim, global, glory, replays, replay_codec as ctfReplayCodec, broadcast,
+  checkpoint,
   replay_runtime, events, wire_constants,
   control, directives, baselines, decide, mux, build_stamp, client_strip,
   ../shell/[body, body_map, episode, ingress, outbound,
@@ -4297,6 +4298,37 @@ proc runServerLoop*(
       else: initSimServer(config)
     lastTick = getMonoTime()
     collectedEvents: seq[SimEvent] = @[]
+
+  # --- Coworld Checkpoints (Metta spec 0157; GAME.md "Checkpoints") --------
+  # All opt-in: with none of these variables set nothing below runs.
+  let
+    snapshotDir = getEnv(CogameSnapshotDirEnv).strip().uriPath()
+    checkpointTicks =
+      if replayLoaded or snapshotDir.len == 0: newSeq[int]()
+      else: parseCheckpointTicks(getEnv(CogameCheckpointTicksEnv),
+        config.maxTicks)
+    loadSnapshotUri = getEnv(CogameLoadSnapshotUriEnv).strip()
+    replayKeyframeTicks = block:
+      let text = getEnv("CTF_REPLAY_KEYFRAME_TICKS").strip()
+      if text.len == 0: 0 else: parseInt(text)
+  var checkpointsWritten: seq[int]
+  if checkpointTicks.len > 0:
+    echo "checkpoints armed: ticks=", checkpointTicks, " dir=", snapshotDir
+  if loadSnapshotUri.len > 0 and not replayLoaded:
+    # Resume at the snapshot's tick. The freshly built sim donates the
+    # static map bakes and THIS process's connection tokens (snapshots never
+    # carry tokens); everything else comes from game.snapshot.
+    let snapshot = loadGameSnapshotUri(loadSnapshotUri)
+    var cursor = ReplayPlayer()
+    cursor.restoreGameSnapshot(sim, snapshot)
+    checkpointsWritten.add(snapshot.tick)   # never re-cut the resume tick
+    echo "snapshot loaded: tick=", snapshot.tick, " seed=", snapshot.seed,
+      " uri=", loadSnapshotUri
+    let reseedText = getEnv(CogameReseedEnv).strip()
+    if reseedText.len > 0:
+      let seed = parseInt(reseedText)
+      sim.reseedSim(seed)
+      echo "snapshot reseeded: rng seed=", seed, " from tick ", sim.tickCount
   sim.collectEvents = eventsPath.len > 0
   block:
     # Bake the supersampled spectator render caches (map, endzone fades,
@@ -5549,6 +5581,34 @@ proc runServerLoop*(
               mask
             )
           stepInputs = downInputs
+        if checkpointTicks.len > 0 and not replayLoaded and
+            sim.tickCount in checkpointTicks and
+            sim.tickCount notin checkpointsWritten:
+          # Spec 0157 / GAME.md "Checkpoints": tick T has stepped, been
+          # hashed and had its input changes recorded; nothing has observed
+          # it yet. The sim is not advanced while the snapshot is cut, so
+          # this IS the pause. game.snapshot is written before manifest.json
+          # (the runner's completion marker).
+          checkpointsWritten.add(sim.tickCount)
+          let checkpointStarted = getMonoTime()
+          try:
+            replayWriter.flushReplayWriter()
+            let replayRecords =
+              if saveReplayPath.len > 0 and fileExists(saveReplayPath):
+                readFile(saveReplayPath)
+              else:
+                ""
+            let snapshot = captureGameSnapshot(
+              ReplayPlayer(), sim, replayRecords)
+            let tickDir = writeCheckpointDir(snapshotDir, snapshot, %*{
+              "restart": getEnv(CogameCheckpointRestartEnv) == "1",
+              "max_ticks": config.maxTicks,
+              "players": sim.players.len
+            })
+            echo "CHECKPOINT tick=", sim.tickCount, " dir=", tickDir,
+              " ms=", (getMonoTime() - checkpointStarted).inMilliseconds
+          except CatchableError as error:
+            echo "CHECKPOINT tick=", sim.tickCount, " failed: ", error.msg
         if config.maxGames > 0 and phaseBeforeStep != GameOver and
             sim.phase == GameOver:
           inc gamesPlayed
@@ -5883,6 +5943,18 @@ proc runServerLoop*(
       if saveReplayPath.len > 0:
         echo "Writing replay file: ", saveReplayPath
       replayWriter.closeReplayWriter()
+      if replayKeyframeTicks > 0 and saveReplayPath.len > 0 and
+          fileExists(saveReplayPath):
+        # Spec 0157: embed seek keyframes (one deterministic re-walk of the
+        # finished match). A failure keeps the plain, still-valid replay.
+        let embedStarted = getMonoTime()
+        try:
+          embedReplayKeyframesFile(saveReplayPath, replayKeyframeTicks)
+          echo "Replay keyframes embedded every ", replayKeyframeTicks,
+            " ticks in ", (getMonoTime() - embedStarted).inMilliseconds, " ms"
+        except CatchableError as error:
+          echo "Replay keyframe embedding failed (plain replay kept): ",
+            error.msg
       if saveReplayPath.len > 0 and fileExists(saveReplayPath):
         echo "Replay written: ", saveReplayPath,
           " (", getFileSize(saveReplayPath), " bytes)"
