@@ -1,0 +1,72 @@
+# Local-only baseline player image for the Coworld Checkpoints Docker E2E
+# (Metta spec 0157; docs/CHECKPOINTS.md "Docker end-to-end run").
+#
+# Why a separate image: the production baseline image (players/baseline/
+# Dockerfile) runs on a nix runtime base that deliberately has NO shell, and
+# the Coworld checkpoint restart supervisor (PLAYER.md "Checkpoints") is a
+# /bin/sh script that becomes PID 1 in place of the image entrypoint. This
+# image builds the same baseline binary and the same reference playbook on
+# plain Debian (native architecture, no emulation), so it has /bin/sh and
+# setsid. It is never published.
+#
+#   docker build -f tools/checkpoints/Dockerfile.baseline-e2e \
+#     -t coworld-ctf-baseline:ckpt .
+#
+# The first stage repeats the game Dockerfile's preamble verbatim so the two
+# builds share Docker layer cache (nim + nimby deps).
+FROM debian:bookworm-slim AS build
+
+RUN apt-get update && \
+  apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    git \
+    xz-utils && \
+  rm -rf /var/lib/apt/lists/*
+
+RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+    curl -fsSL \
+      -o /usr/local/bin/nimby \
+https://github.com/treeform/nimby/releases/download/0.1.26/nimby-Linux-X64; \
+  elif [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+    curl -fsSL \
+      -o /usr/local/bin/nimby \
+https://github.com/treeform/nimby/releases/download/0.1.26/nimby-Linux-ARM64; \
+  else \
+    echo "unsupported arch: $(dpkg --print-architecture)" && exit 1; \
+  fi && \
+  chmod +x /usr/local/bin/nimby && \
+  nimby use 2.2.4
+
+ENV PATH="/root/.nimby/nim/bin:$PATH"
+
+WORKDIR /workspace/ctf
+COPY nimby.lock .
+RUN nimby --global sync nimby.lock
+
+# The reference playbook, built before the full source copy so it caches
+# independently of src/ and players/ edits.
+FROM build AS playbook
+COPY play_sdk ./play_sdk
+COPY tools/runtime_spike ./tools/runtime_spike
+COPY policies/starters/common/build_playbook.sh ./policies/starters/common/
+RUN apt-get update && apt-get install -y --no-install-recommends bash && \
+  rm -rf /var/lib/apt/lists/* && \
+  chmod +x policies/starters/common/build_playbook.sh && \
+  policies/starters/common/build_playbook.sh /playbook
+
+FROM build AS baseline
+COPY . .
+RUN nim c -d:release -d:useMalloc --opt:speed --stackTrace:on \
+  --nimcache:/tmp/baseline-nimcache --out:baseline \
+  players/baseline/baseline.nim
+
+FROM debian:bookworm-slim
+RUN apt-get update && \
+  apt-get install -y --no-install-recommends ca-certificates libcurl4 && \
+  rm -rf /var/lib/apt/lists/*
+COPY --from=baseline /workspace/ctf/baseline /bin/baseline
+COPY --from=playbook /playbook /playbook
+ENV BASELINE_PLAYBOOK=/playbook
+CMD ["/bin/baseline"]

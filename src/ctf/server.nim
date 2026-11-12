@@ -19,6 +19,25 @@ when defined(posix):
   from std/posix import SHUT_RDWR, shutdown
 
 type
+  CheckpointHold = object
+    ## Spec 0157: tick T held for player restarts (COGAME_CHECKPOINT_RESTART)
+    ## or for the seats of a restored game. `serials[i]` is slot
+    ## `slots[i]`'s connect serial when the hold began.
+    active: bool
+    tick: int
+    reason: string
+    slots: seq[int]
+    serials: seq[int]
+    startedAt: MonoTime
+    deadline: MonoTime
+
+const
+  RestartGraceSeconds = 30
+    ## Checkpoint restart: kill + respawn + reconnect in a warm container.
+  RestoreGraceSeconds = 90
+    ## Restored game: fresh player containers start alongside the game.
+
+type
   PlayModuleUploadConsumer* = proc(
     websocket: WebSocket,
     seat: int,
@@ -228,6 +247,19 @@ type
     voteResolutionRecorded: bool
     lobbyTranscript: seq[LobbyChatRecord]
     lobbyTranscriptTicks: seq[uint32]
+    # --- Coworld Checkpoints (spec 0157) -------------------------------
+    checkpointAcks: Table[int, int]
+      ## slot -> the tick that slot last acknowledged with checkpoint_ack.
+    seatConnectSerial: seq[int]
+      ## slot -> bumped on every player-socket registration for that slot.
+    seatActedSerial: seq[int]
+      ## slot -> the connect serial whose socket last sent a message.
+    checkpointHoldActive: bool
+      ## While a checkpoint restart or a restore waits for its seats, a
+      ## player socket that drops keeps its cog (no leave, no abandon).
+    resumeSeatPlayerIndices: seq[int]
+      ## slot -> the existing cog a reconnecting socket rebinds to, filled
+      ## by a snapshot restore and by sockets dropped during a hold.
 
   ServerThreadArgs = object
     server: ptr Server
@@ -685,6 +717,11 @@ proc initAppState() =
   appState.pendingLobbyChats = @[]
   appState.lobbyTranscript = @[]
   appState.lobbyTranscriptTicks = @[]
+  appState.checkpointAcks = initTable[int, int]()
+  appState.seatConnectSerial = @[]
+  appState.seatActedSerial = @[]
+  appState.checkpointHoldActive = false
+  appState.resumeSeatPlayerIndices = @[]
 
 proc comparePendingPlayerJoins(
   a,
@@ -768,6 +805,11 @@ proc configurePlayIngress(config: GameConfig) =
     appState.playIngress[seat] = initPlayIngressSeat[WebSocket]()
     appState.seatTombstones[seat] = initSeatTombstone()
     appState.seatPlayerIndices[seat] = -1
+  appState.seatConnectSerial = newSeq[int](config.slots.len)
+  appState.seatActedSerial = newSeq[int](config.slots.len)
+  appState.resumeSeatPlayerIndices = newSeq[int](config.slots.len)
+  for seat in 0 ..< config.slots.len:
+    appState.resumeSeatPlayerIndices[seat] = -1
   appState.pendingLifecycleRecords = @[]
   appState.pendingPlayCallRecords = @[]
   appState.pendingShellAnnotations = @[]
@@ -1135,6 +1177,15 @@ proc registerPlayerWebSocket(
       slot >= 0 and slot < appState.seatPlayerIndices.len and
       appState.seatPlayerIndices[slot] >= 0:
     restoredPlayerIndex = appState.seatPlayerIndices[slot]
+  if restoredPlayerIndex == UnresolvedPlayerIndex and slot >= 0 and
+      slot < appState.resumeSeatPlayerIndices.len and
+      appState.resumeSeatPlayerIndices[slot] >= 0:
+    # Spec 0157: a restored game, or a checkpoint restart hold, rebinds the
+    # reconnecting slot to its EXISTING cog -- no new join, no new row.
+    restoredPlayerIndex = appState.resumeSeatPlayerIndices[slot]
+    appState.resumeSeatPlayerIndices[slot] = -1
+  if slot >= 0 and slot < appState.seatConnectSerial.len:
+    inc appState.seatConnectSerial[slot]
   appState.playerViewers[websocket] = initPlayerViewerState()
   appState.playerAddresses[websocket] = identity
   appState.playerSlots[websocket] = slot
@@ -3123,10 +3174,23 @@ proc websocketHandler(
   of MessageEvent:
     if message.kind == Ping:
       websocket.send(message.data, Pong)
+    elif message.kind == TextMessage:
+      # Spec 0157: the checkpoint handshake rides TEXT frames, which every
+      # existing client (binary Sprite/play-seat codecs) already ignores.
+      {.gcsafe.}:
+        withLock appState.lock:
+          let slot = appState.playerSlots.getOrDefault(websocket, -1)
+          let tick = message.data.checkpointAckTick()
+          if slot >= 0 and tick >= 0:
+            appState.checkpointAcks[slot] = tick
     elif message.kind == BinaryMessage:
       var disconnectPlaySocket = false
       {.gcsafe.}:
         withLock appState.lock:
+          block:
+            let slot = appState.playerSlots.getOrDefault(websocket, -1)
+            if slot >= 0 and slot < appState.seatActedSerial.len:
+              appState.seatActedSerial[slot] = appState.seatConnectSerial[slot]
           let playSeat = websocket.playSeatIndex()
           if playSeat >= 0 and websocket in appState.playerViewers and
               not appState.replayLoaded:
@@ -4312,23 +4376,71 @@ proc runServerLoop*(
       let text = getEnv("CTF_REPLAY_KEYFRAME_TICKS").strip()
       if text.len == 0: 0 else: parseInt(text)
   var checkpointsWritten: seq[int]
+  var
+    resumed = false
+    resumedSnapshot: GameSnapshot
+    checkpointHold: CheckpointHold
   if checkpointTicks.len > 0:
     echo "checkpoints armed: ticks=", checkpointTicks, " dir=", snapshotDir
   if loadSnapshotUri.len > 0 and not replayLoaded:
     # Resume at the snapshot's tick. The freshly built sim donates the
     # static map bakes and THIS process's connection tokens (snapshots never
     # carry tokens); everything else comes from game.snapshot.
-    let snapshot = loadGameSnapshotUri(loadSnapshotUri)
+    resumedSnapshot = loadGameSnapshotUri(loadSnapshotUri)
+    resumed = true
+    # Rebuild the donor sim from the snapshot's OWN config (its seed picks
+    # and installs the map), keeping this process's fresh connection tokens.
+    block:
+      var resumeConfig = resumedSnapshot.snapshotConfig()
+      for i in 0 ..< min(resumeConfig.slots.len, config.slots.len):
+        resumeConfig.slots[i].token = config.slots[i].token
+      if resumeConfig.seed != config.seed:
+        echo "snapshot: episode seed ", resumeConfig.seed,
+          " replaces this boot's seed ", config.seed
+      config = resumeConfig
+      sim = initSimServer(config)
+      {.gcsafe.}:
+        withLock appState.lock:
+          appState.config = config
     var cursor = ReplayPlayer()
-    cursor.restoreGameSnapshot(sim, snapshot)
-    checkpointsWritten.add(snapshot.tick)   # never re-cut the resume tick
-    echo "snapshot loaded: tick=", snapshot.tick, " seed=", snapshot.seed,
+    cursor.restoreGameSnapshot(sim, resumedSnapshot)
+    checkpointsWritten.add(resumedSnapshot.tick)   # never re-cut the resume tick
+    echo "snapshot loaded: tick=", resumedSnapshot.tick, " seed=",
+      resumedSnapshot.seed, " players=", sim.players.len,
       " uri=", loadSnapshotUri
+    if getEnv("COGAME_GAME_PATCH_URI").strip().len > 0:
+      echo "snapshot: COGAME_GAME_PATCH_URI ignored (game.snapshot is ",
+        "binary; Paintbot has no JSON state-override hook)"
     let reseedText = getEnv(CogameReseedEnv).strip()
     if reseedText.len > 0:
       let seed = parseInt(reseedText)
       sim.reseedSim(seed)
       echo "snapshot reseeded: rng seed=", seed, " from tick ", sim.tickCount
+    # Live resume: every restored cog keeps its row. A reconnecting socket
+    # for slot S rebinds to the cog whose joinOrder is S instead of joining.
+    {.gcsafe.}:
+      withLock appState.lock:
+        for playerIndex, player in sim.players:
+          let slot = player.joinOrder
+          if slot >= 0 and slot < appState.resumeSeatPlayerIndices.len:
+            appState.resumeSeatPlayerIndices[slot] = playerIndex
+          if config.isPlaySeatEpisode() and slot >= 0 and
+              slot < appState.seatPlayerIndices.len:
+            appState.seatPlayerIndices[slot] = playerIndex
+            if config.isPlaySeat(slot):
+              appState.playIngress[slot].playerIndex = playerIndex
+        appState.shellEpisodeInLobby = sim.phase == Lobby
+    # One continuous replay: continue the checkpoint's record stream instead
+    # of the fresh header this process opened above.
+    if saveReplayPath.len > 0 and resumedSnapshot.replayRecords.len > 0:
+      replayWriter.abandonReplayWriter()
+      replayWriter = ctfReplayCodec.resumeReplayWriter(saveReplayPath,
+        resumedSnapshot.replayRecords, CtfReplaySpec,
+        ReplayCompatibleGameVersions, resumedSnapshot.replayLastMasks)
+      lastDirectAim = resumedSnapshot.replayLastDirectAim
+      echo "replay resumed: ", resumedSnapshot.replayRecords.len,
+        " prefix bytes, format ",
+        (if replayWriter.shellEpisode: "2" else: "1")
   sim.collectEvents = eventsPath.len > 0
   block:
     # Bake the supersampled spectator render caches (map, endzone fades,
@@ -4404,6 +4516,47 @@ proc runServerLoop*(
     runtimeConfig.config)
   defer:
     shellEpisode.closeShellEpisode()
+  if resumed:
+    # Tick T + 1 reads tick T's applied inputs as its previous inputs.
+    prevInputs = @[]
+    for mask in resumedSnapshot.prevInputMasks:
+      prevInputs.add(decodeInputMask(mask))
+    # Spec 0157, play-seat shell state ("serialized"): re-admit each seat's
+    # modules and re-accept its standing ladder before tick T + 1, so the
+    # seat's cog keeps running the same plays across the restore.
+    for seatState in resumedSnapshot.shellSeats:
+      var uploads: seq[tuple[uploadId: uint64, wasm: string]]
+      for upload in seatState.uploads:
+        uploads.add((upload.uploadId, upload.wasm))
+      if shellEpisode.enabled:
+        for line in shellEpisode.restorePlaySeat(seatState.seat, uploads,
+            seatState.callNumber, seatState.callProposalId,
+            seatState.callBytes, uint32(sim.tickCount)):
+          echo line
+      {.gcsafe.}:
+        withLock appState.lock:
+          if seatState.seat >= 0 and seatState.seat < appState.playIngress.len:
+            appState.playIngress[seatState.seat].restoreUploadHistory(
+              uploads, seatState.admittedModules,
+              seatState.admittedUploadBytes, seatState.hasUploadIdFloor,
+              seatState.uploadIdFloor, seatState.hasProposalIdFloor,
+              seatState.proposalIdFloor)
+    # A restored game waits (bounded) for every restored seat to reconnect
+    # and act before stepping T + 1, as it waits for joins at tick 0.
+    checkpointHold = CheckpointHold(active: true, tick: sim.tickCount,
+      reason: "restore", startedAt: getMonoTime(),
+      deadline: getMonoTime() + initDuration(seconds = RestoreGraceSeconds))
+    {.gcsafe.}:
+      withLock appState.lock:
+        for slot in 0 ..< appState.resumeSeatPlayerIndices.len:
+          if appState.resumeSeatPlayerIndices[slot] >= 0:
+            checkpointHold.slots.add(slot)
+            # A fresh process: any connection for the slot counts, even one
+            # that arrived while the board was still baking.
+            checkpointHold.serials.add(0)
+        appState.checkpointHoldActive = true
+    echo "CHECKPOINT_HOLD restore tick=", sim.tickCount, " seats=",
+      checkpointHold.slots
 
   while true:
     var
@@ -4518,6 +4671,24 @@ proc runServerLoop*(
           appState.chatMessages.clear()
           appState.policyPageFlashes.clear()
         for websocket in appState.closedSockets:
+          if not replayLoaded and appState.checkpointHoldActive and
+              websocket in appState.playerIndices:
+            # Spec 0157: a player killed for a checkpoint restart (or not yet
+            # back after a restore) keeps its cog. Its reconnect rebinds via
+            # resumeSeatPlayerIndices; play seats use the shell's own stable
+            # rows below.
+            let
+              holdSlot = appState.playerSlots.getOrDefault(websocket, -1)
+              holdIndex = appState.playerIndices[websocket]
+            if holdSlot >= 0 and
+                holdSlot < appState.resumeSeatPlayerIndices.len and
+                not appState.config.isPlaySeat(holdSlot) and
+                holdIndex >= 0 and holdIndex < sim.players.len:
+              appState.resumeSeatPlayerIndices[holdSlot] = holdIndex
+              if holdIndex < prevInputs.len:
+                prevInputs[holdIndex] = InputState()
+              discard removeWebSocketState(websocket)
+              continue
           if not replayLoaded and
               sim.retainShellSocketLoss(websocket, prevInputs):
             continue
@@ -5311,7 +5482,40 @@ proc runServerLoop*(
         stepInputs = inputs
         stepPressedInputMasks = pressedInputMasks
         lastStepInputs = prevInputs
+      if checkpointHold.active:
+        # Spec 0157 hold: tick T is not advanced until every held seat has
+        # reconnected (a new socket for the slot) and acted (any message;
+        # a play seat's cog is driven by its standing ladder, so the
+        # reconnect itself is enough), or the grace window ends.
+        var waiting: seq[int]
+        {.gcsafe.}:
+          withLock appState.lock:
+            for i, slot in checkpointHold.slots:
+              let
+                connected = slot < appState.seatConnectSerial.len and
+                  appState.seatConnectSerial[slot] > checkpointHold.serials[i]
+                acted = config.isPlaySeat(slot) or
+                  (slot < appState.seatActedSerial.len and
+                    appState.seatActedSerial[slot] ==
+                      appState.seatConnectSerial[slot])
+              if not (connected and acted):
+                waiting.add(slot)
+        let expired = getMonoTime() >= checkpointHold.deadline
+        if waiting.len == 0 or expired:
+          checkpointHold.active = false
+          {.gcsafe.}:
+            withLock appState.lock:
+              appState.checkpointHoldActive = false
+              # A seat that never came back is an ordinary absent seat now.
+              for slot in 0 ..< appState.resumeSeatPlayerIndices.len:
+                appState.resumeSeatPlayerIndices[slot] = -1
+          echo "CHECKPOINT_HOLD released reason=", checkpointHold.reason,
+            " tick=", checkpointHold.tick,
+            " waited_ms=", (getMonoTime() - checkpointHold.startedAt).inMilliseconds,
+            " missing=", waiting
       for _ in 0 ..< playbackSpeed(liveSpeedIndex):
+        if checkpointHold.active:
+          break
         var shellSeatsThisTick = 0
         if config.isPlaySeatEpisode():
           drainPlayIngressAtTickBoundary(
@@ -5590,7 +5794,40 @@ proc runServerLoop*(
           # this IS the pause. game.snapshot is written before manifest.json
           # (the runner's completion marker).
           checkpointsWritten.add(sim.tickCount)
-          let checkpointStarted = getMonoTime()
+          let
+            checkpointTick = sim.tickCount
+            checkpointStarted = getMonoTime()
+            restartPlayers = getEnv(CogameCheckpointRestartEnv) == "1"
+          # 1. Prompt every connected player seat to save (TEXT frame) and
+          #    wait up to 2 s for each checkpoint_ack. Late seats are not
+          #    waited for.
+          var promptedSlots: seq[int]
+          {.gcsafe.}:
+            withLock appState.lock:
+              let prompt = checkpointMessage(checkpointTick)
+              for websocket, slot in appState.playerSlots.pairs:
+                if slot >= 0 and websocket.isPlayerWebSocket() and
+                    slot notin promptedSlots:
+                  appState.checkpointAcks.del(slot)
+                  promptedSlots.add(slot)
+                  websocket.send(prompt, TextMessage)
+          promptedSlots.sort()
+          var ackedSlots: seq[int]
+          let ackDeadline = checkpointStarted +
+            initDuration(milliseconds = CheckpointDeadlineMs)
+          while true:
+            ackedSlots.setLen(0)
+            {.gcsafe.}:
+              withLock appState.lock:
+                for slot in promptedSlots:
+                  if appState.checkpointAcks.getOrDefault(slot, -1) ==
+                      checkpointTick:
+                    ackedSlots.add(slot)
+            if ackedSlots.len == promptedSlots.len or
+                getMonoTime() >= ackDeadline:
+              break
+            sleep(2)
+          # 2. game.snapshot, then manifest.json LAST (the runner's marker).
           try:
             replayWriter.flushReplayWriter()
             let replayRecords =
@@ -5598,17 +5835,67 @@ proc runServerLoop*(
                 readFile(saveReplayPath)
               else:
                 ""
-            let snapshot = captureGameSnapshot(
+            var snapshot = captureGameSnapshot(
               ReplayPlayer(), sim, replayRecords)
+            snapshot.replayLastMasks = replayWriter.lastMasks
+            snapshot.replayLastDirectAim = lastDirectAim
+            for input in lastStepInputs:
+              snapshot.prevInputMasks.add(encodeInputMask(input))
+            if shellEpisode.enabled:
+              for seat in 0 ..< config.slots.len:
+                if not config.isPlaySeat(seat):
+                  continue
+                var seatState = ShellSeatSnapshot(seat: seat)
+                let recovery = shellEpisode.shellRecovery(seat)
+                seatState.callNumber = recovery.callNumber
+                if recovery.call.isSome:
+                  seatState.callProposalId = recovery.call.get.proposalId
+                  seatState.callBytes = recovery.call.get.bytes
+                {.gcsafe.}:
+                  withLock appState.lock:
+                    let ingress = appState.playIngress[seat]
+                    for upload in ingress.uploadHistory():
+                      seatState.uploads.add(ShellUploadSnapshot(
+                        uploadId: upload.uploadId, wasm: upload.wasm))
+                    seatState.admittedModules = ingress.admittedModules
+                    seatState.admittedUploadBytes = ingress.admittedUploadBytes
+                    seatState.hasUploadIdFloor = ingress.hasUploadIdFloor
+                    seatState.uploadIdFloor = ingress.uploadIdFloor
+                    seatState.hasProposalIdFloor = ingress.hasProposalIdFloor
+                    seatState.proposalIdFloor = ingress.proposalIdFloor
+                snapshot.shellSeats.add(seatState)
             let tickDir = writeCheckpointDir(snapshotDir, snapshot, %*{
-              "restart": getEnv(CogameCheckpointRestartEnv) == "1",
+              "restart": restartPlayers,
               "max_ticks": config.maxTicks,
-              "players": sim.players.len
+              "players": sim.players.len,
+              "prompted_slots": promptedSlots,
+              "acked_slots": ackedSlots,
+              "play_seats_saved": snapshot.shellSeats.len
             })
-            echo "CHECKPOINT tick=", sim.tickCount, " dir=", tickDir,
+            echo "CHECKPOINT tick=", checkpointTick, " dir=", tickDir,
+              " prompted=", promptedSlots, " acked=", ackedSlots,
               " ms=", (getMonoTime() - checkpointStarted).inMilliseconds
           except CatchableError as error:
-            echo "CHECKPOINT tick=", sim.tickCount, " failed: ", error.msg
+            echo "CHECKPOINT tick=", checkpointTick, " failed: ", error.msg
+          # 3. COGAME_CHECKPOINT_RESTART=1: hold tick T until every prompted
+          #    seat has been killed, respawned, reconnected and acted.
+          if restartPlayers and promptedSlots.len > 0:
+            checkpointHold = CheckpointHold(active: true,
+              tick: checkpointTick, reason: "restart",
+              startedAt: getMonoTime(),
+              deadline: getMonoTime() +
+                initDuration(seconds = RestartGraceSeconds))
+            {.gcsafe.}:
+              withLock appState.lock:
+                for slot in promptedSlots:
+                  checkpointHold.slots.add(slot)
+                  checkpointHold.serials.add(
+                    if slot < appState.seatConnectSerial.len:
+                      appState.seatConnectSerial[slot]
+                    else: 0)
+                appState.checkpointHoldActive = true
+            echo "CHECKPOINT_HOLD restart tick=", checkpointTick,
+              " seats=", checkpointHold.slots
         if config.maxGames > 0 and phaseBeforeStep != GameOver and
             sim.phase == GameOver:
           inc gamesPlayed

@@ -16,6 +16,30 @@ import
   build_stamp, portable_flatty, replays, sim
 
 type
+  ShellUploadSnapshot* = object
+    uploadId*: uint64
+    wasm*: string
+
+  ShellSeatSnapshot* = object
+    ## One play seat's game-side shell state (spec 0157 "serialized" option):
+    ## every module the seat had admitted, its ingress id floors and budgets,
+    ## and its standing ladder call. A restoring server re-admits the modules
+    ## and re-accepts the call through the production shell seams before
+    ## tick T + 1, so the seat's cog keeps running the same plays whether or
+    ## not its player reconnects. Play-instance guest memory is NOT carried:
+    ## each standing entry restarts from a fresh instance.
+    seat*: int
+    uploads*: seq[ShellUploadSnapshot]
+    admittedModules*: int
+    admittedUploadBytes*: uint64
+    hasUploadIdFloor*: bool
+    uploadIdFloor*: uint64
+    hasProposalIdFloor*: bool
+    proposalIdFloor*: uint64
+    callNumber*: uint64
+    callProposalId*: uint64
+    callBytes*: string
+
   GameSnapshot* = object
     version*: int
     tick*: int
@@ -28,9 +52,17 @@ type
       ## no keyframe trailer), so a resumed match writes ONE continuous
       ## `.bitreplay`. Empty when the snapshot was cut outside a recording
       ## server (tests, offline tools).
+    replayLastMasks*: seq[uint8]
+      ## The replay writer's per-player input-dedupe state at `tick`.
+    replayLastDirectAim*: seq[int]
+      ## The direct-aim dedupe state beside it (-1 = channel off).
+    prevInputMasks*: seq[uint8]
+      ## The inputs applied at `tick`, which tick T + 1 reads as its
+      ## previous inputs (press-edge detection).
+    shellSeats*: seq[ShellSeatSnapshot]
 
 const
-  GameSnapshotVersion* = 1
+  GameSnapshotVersion* = 2
   GameSnapshotFile* = "game.snapshot"
   CheckpointManifestFile* = "manifest.json"
   CogameLoadSnapshotUriEnv* = "COGAME_LOAD_SNAPSHOT_URI"
@@ -116,6 +148,14 @@ proc decodeGameSnapshot*(bytes: string): GameSnapshot =
   if not result.keyframe.portable:
     raise newException(ValueError, "game.snapshot keyframe is not portable")
 
+proc snapshotConfig*(snapshot: GameSnapshot): GameConfig =
+  ## The GameConfig the snapshot's episode ran under (seed, resolved map,
+  ## slots). A restoring server must build its sim from THIS, not from a
+  ## freshly randomized seed: map geometry is installed process-wide from
+  ## the config at sim init, and the restored sim's static bakes come from
+  ## that freshly built sim.
+  snapshot.keyframe.simBytes.fromPortableFlatty(SimServer).config
+
 proc restoreGameSnapshot*(
   player: var ReplayPlayer,
   sim: var SimServer,
@@ -174,3 +214,19 @@ proc writeCheckpointDir*(
 
 proc loadGameSnapshotUri*(uri: string): GameSnapshot =
   decodeGameSnapshot(readFile(uri.uriPath))
+
+proc checkpointMessage*(tick: int): string =
+  ## GAME.md "Checkpoints": the save prompt, sent as a WebSocket TEXT frame.
+  $(%*{"type": "checkpoint", "tick": tick, "deadline_ms": CheckpointDeadlineMs})
+
+proc checkpointAckTick*(text: string): int =
+  ## The tick of a `{"type": "checkpoint_ack", "tick": T}` text frame, or -1
+  ## for any other text.
+  result = -1
+  try:
+    let node = parseJson(text)
+    if node.kind == JObject and node{"type"}.getStr("") == "checkpoint_ack" and
+        node{"tick"} != nil and node{"tick"}.kind == JInt:
+      result = node{"tick"}.getInt()
+  except CatchableError:
+    discard
