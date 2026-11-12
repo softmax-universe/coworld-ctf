@@ -1,9 +1,10 @@
 import
-  std/[json, strutils, tables],
+  std/[json, os, strutils, tables],
   flatty,
+  zippy,
   bitworld/spriteprotocol,
   bitworld/replays as replayCodec,
-  broadcast, build_stamp, sim, global,
+  broadcast, build_stamp, sim, global, portable_flatty,
   replay_codec as ctfReplayCodec,
   ../shell/[replay_records, seats]
 
@@ -34,6 +35,11 @@ type
     ballotIndex*: int
       ## MAP VOTE: cursor into ReplayPlayer.ballots at this keyframe, so a
       ## seek re-applies exactly the casts the walk had applied by then.
+    portable*: bool
+      ## True when `simBytes` / `overlaysBytes` are portable_flatty encoded
+      ## (embedded keyframes written by the native server and read by the
+      ## 32-bit wasm viewer); false for the viewer's own in-memory keyframes,
+      ## which keep the faster native flatty encoding.
 
   ReplayPlayer* = object
     data*: ReplayData
@@ -81,6 +87,10 @@ type
       ## nothing can be proven, and the loud banner's whole meaning is
       ## "this exact engine failed to reproduce its own recording".
     keyframes*: seq[ReplayKeyframe]
+    embeddedKeyframes*: bool
+      ## True when `keyframes` came from the replay file's embedded keyframe
+      ## trailer (spec 0157): they cover the whole match from frame 1, so the
+      ## precompute walk keeps them instead of rebuilding its own.
     startTick*: int
       ## First tick the match is actually being PLAYED (the Lobby "WAITING FOR
       ## PLAYERS" span before this is dead air a spectator should never have to
@@ -185,6 +195,8 @@ type
       ## sixteen-way wipe on tick 1.
     interval: int
     maxTick: int
+    portable: bool
+      ## Encode keyframes with portable_flatty (for embedding in a file).
 
 # PlaybackSpeeds moved to sim_types.nim (the single source for every speed-coupled
 # layer); re-exported here for the existing `import replays` consumers.
@@ -657,6 +669,17 @@ proc serializeReplaySim*(sim: var SimServer): string =
   result = sim.toFlatty()
   sim.swapStaticBakes(bakes)
 
+proc serializePortableReplaySim*(sim: var SimServer): string =
+  ## serializeReplaySim with pointer-width-portable framing: the bytes a
+  ## 64-bit server writes decode in the 32-bit wasm viewer. Used for
+  ## keyframes embedded in a `.bitreplay` and for game checkpoints.
+  var bakes: ReplayStaticBakes
+  sim.swapStaticBakes(bakes)
+  result = sim.toPortableFlatty()
+  sim.swapStaticBakes(bakes)
+
+proc attachDonorBakes(result: var SimServer, donor: var SimServer)
+
 proc deserializeReplaySim*(bytes: string, donor: var SimServer): SimServer =
   ## Deserializes one simulation state from a replay keyframe, taking the
   ## static map bakes from `donor` — the same episode's outgoing sim, whose
@@ -664,6 +687,17 @@ proc deserializeReplaySim*(bytes: string, donor: var SimServer): SimServer =
   ## semantics: `donor` gives its bakes to the returned sim (every caller
   ## replaces the donor with the result immediately after).
   result = bytes.fromFlatty(SimServer)
+  result.attachDonorBakes(donor)
+
+proc deserializePortableReplaySim*(
+  bytes: string,
+  donor: var SimServer
+): SimServer =
+  ## deserializeReplaySim for serializePortableReplaySim bytes.
+  result = bytes.fromPortableFlatty(SimServer)
+  result.attachDonorBakes(donor)
+
+proc attachDonorBakes(result: var SimServer, donor: var SimServer) =
   ## MAP VOTE: "static for the whole episode" stopped being true the day a
   ## resolved map ballot could swap the episode map mid-lobby. The keyframe
   ## DOES serialize `gameMap` (only the derived bakes are stripped), so a
@@ -717,6 +751,43 @@ proc recordedEngineStamp*(configJson: string): string =
   except CatchableError:
     result = ""
 
+type
+  EmbeddedKeyframeSet* = object
+    ## The decoded embedded-keyframe trailer of one `.bitreplay` (spec 0157).
+    ## On the wire: zlib(toPortableFlatty(EmbeddedKeyframeSet)).
+    version*: int
+    interval*: int
+      ## Ticks between keyframes; a seek re-simulates at most interval-1.
+    gameVersion*: string
+      ## GameVersion of the engine that walked the keyframes. A reader on a
+      ## different GameVersion ignores them (the sim layout may differ) and
+      ## falls back to its own precompute walk.
+    simStamp*: string
+      ## ctfSimSourcesStamp of the writer ("" for unstamped dev builds).
+    keyframes*: seq[ReplayKeyframe]
+
+const
+  EmbeddedKeyframeVersion* = 1
+  DefaultEmbeddedKeyframeTicks* = 200
+    ## Below SeekTicksPerFrame, so any seek converges inside the frame it
+    ## was clicked on.
+
+proc encodeEmbeddedKeyframes*(set: EmbeddedKeyframeSet): string =
+  compress(set.toPortableFlatty(), BestSpeed, dfZlib)
+
+proc decodeEmbeddedKeyframes*(blob: string): EmbeddedKeyframeSet =
+  ## Raises on a corrupt or foreign block; callers fall back to scanning.
+  result = uncompress(blob, dfZlib).fromPortableFlatty(EmbeddedKeyframeSet)
+  if result.version != EmbeddedKeyframeVersion:
+    raise newException(ReplayError,
+      "unsupported embedded keyframe version " & $result.version)
+  for keyframe in result.keyframes:
+    if not keyframe.portable:
+      raise newException(ReplayError, "embedded keyframe is not portable")
+  for i in 1 ..< result.keyframes.len:
+    if result.keyframes[i].tick <= result.keyframes[i - 1].tick:
+      raise newException(ReplayError, "embedded keyframes are not ascending")
+
 proc initReplayPlayer*(data: ReplayData): ReplayPlayer =
   ## Builds replay playback state.
   result.data = data
@@ -748,6 +819,26 @@ proc initReplayPlayer*(data: CtfReplayData): ReplayPlayer =
   result.ballots = data.shell.ballots
   result.playSeats = configuredPlaySeats(data.replay.configJson)
   result.lifecyclePlayback = initLifecyclePlayback(result.playSeats)
+  if data.keyframeBlob.len > 0:
+    # Spec 0157: a keyframed replay seeks anywhere on frame 1. A block this
+    # build cannot use (other GameVersion, corrupt bytes, a value too wide
+    # for wasm32) is dropped with a log line; the precompute walk then
+    # derives keyframes exactly as for a legacy replay.
+    try:
+      let embedded = decodeEmbeddedKeyframes(data.keyframeBlob)
+      if embedded.gameVersion != GameVersion or (
+          embedded.simStamp.len > 0 and ctfSimSourcesStamp.len > 0 and
+          embedded.simStamp != ctfSimSourcesStamp):
+        echo "embedded replay keyframes ignored: walked by GameVersion ",
+          embedded.gameVersion, " build ", embedded.simStamp,
+          ", this engine is ", GameVersion, " build ", ctfSimSourcesStamp
+      elif embedded.keyframes.len == 0 or embedded.keyframes[0].tick != 0:
+        echo "embedded replay keyframes ignored: no tick-0 keyframe"
+      else:
+        result.keyframes = embedded.keyframes
+        result.embeddedKeyframes = true
+    except CatchableError as error:
+      echo "embedded replay keyframes ignored: ", error.msg
 
 proc replaySpeed*(replay: ReplayPlayer): int =
   ## Returns the current integer replay speed.
@@ -783,14 +874,19 @@ proc resetReplay*(replay: var ReplayPlayer) =
   replay.directAim = @[]
   replay.overlays = @[]
 
-proc saveReplayKeyframe(
+proc saveReplayKeyframe*(
   replay: ReplayPlayer,
-  sim: var SimServer
+  sim: var SimServer,
+  portable = false
 ): ReplayKeyframe =
-  ## Builds one replay keyframe from the current playback state.
+  ## Builds one replay keyframe from the current playback state. A
+  ## `portable` keyframe is framed for embedding in a replay file.
   ReplayKeyframe(
     tick: sim.tickCount,
-    simBytes: serializeReplaySim(sim),
+    simBytes:
+      if portable: serializePortableReplaySim(sim)
+      else: serializeReplaySim(sim),
+    portable: portable,
     joinIndex: replay.joinIndex,
     leaveIndex: replay.leaveIndex,
     chatIndex: replay.chatIndex,
@@ -799,7 +895,9 @@ proc saveReplayKeyframe(
     hashIndex: replay.hashIndex,
     lifecycleIndex: replay.lifecycleIndex,
     ballotIndex: replay.ballotIndex,
-    overlaysBytes: replay.overlays.toFlatty(),
+    overlaysBytes:
+      if portable: replay.overlays.toPortableFlatty()
+      else: replay.overlays.toFlatty(),
     masks: replay.masks,
     lastAppliedMasks: replay.lastAppliedMasks,
     directAim: replay.directAim,
@@ -808,7 +906,7 @@ proc saveReplayKeyframe(
     lifecyclePlayback: replay.lifecyclePlayback
   )
 
-proc restoreReplayKeyframe(
+proc restoreReplayKeyframe*(
   replay: var ReplayPlayer,
   sim: var SimServer,
   keyframe: ReplayKeyframe
@@ -817,7 +915,9 @@ proc restoreReplayKeyframe(
   ## donates its static map bakes to the restored one (keyframes exclude
   ## them — see serializeReplaySim).
   let gameEventLoggingEnabled = sim.gameEventLoggingEnabled
-  var restored = deserializeReplaySim(keyframe.simBytes, sim)
+  var restored =
+    if keyframe.portable: deserializePortableReplaySim(keyframe.simBytes, sim)
+    else: deserializeReplaySim(keyframe.simBytes, sim)
   restored.gameEventLoggingEnabled = gameEventLoggingEnabled
   sim = move(restored)
   replay.joinIndex = keyframe.joinIndex
@@ -829,7 +929,11 @@ proc restoreReplayKeyframe(
   replay.lifecycleIndex = keyframe.lifecycleIndex
   replay.ballotIndex = keyframe.ballotIndex
   replay.lifecyclePlayback = keyframe.lifecyclePlayback
-  replay.overlays = keyframe.overlaysBytes.fromFlatty(seq[DebugOverlay])
+  replay.overlays =
+    if keyframe.portable:
+      keyframe.overlaysBytes.fromPortableFlatty(seq[DebugOverlay])
+    else:
+      keyframe.overlaysBytes.fromFlatty(seq[DebugOverlay])
   replay.masks = keyframe.masks
   replay.pressedMasks = newSeq[uint8](replay.masks.len)
   replay.lastAppliedMasks = keyframe.lastAppliedMasks
@@ -1264,14 +1368,18 @@ proc advanceReplayScan*(replay: var ReplayPlayer, maxTicks: int)
 proc initReplayScan*(
   replay: var ReplayPlayer,
   initialSim: SimServer,
-  interval = ReplayKeyframeTicks
+  interval = ReplayKeyframeTicks,
+  portable = false
 ) =
   ## Starts the whole-match precompute walk: seek keyframes, the per-team
   ## lives change-point series (momentum graph), the flag-story beats, and
   ## the beat ticks the lull map derives from. The walk advances via
   ## advanceReplayScan — a bounded slice per presentation frame in the
-  ## hosted viewer, or all at once via buildReplayKeyframes.
-  replay.keyframes = @[]
+  ## hosted viewer, or all at once via buildReplayKeyframes. When the replay
+  ## file embedded its own keyframes (spec 0157) they already cover the whole
+  ## match, so the walk keeps them and only derives the chrome series.
+  if not replay.embeddedKeyframes:
+    replay.keyframes = @[]
   replay.leadSeries = @[]
   replay.heatSeries = @[]
   replay.leadOutTicks = @[]
@@ -1279,7 +1387,7 @@ proc initReplayScan*(
   replay.beatEvents = newJArray()
   replay.achievementBadges = newJArray()
   replay.scanDone = false
-  var scan = ReplayScan(interval: max(interval, 1))
+  var scan = ReplayScan(interval: max(interval, 1), portable: portable)
   scan.sim = initialSim
   scan.sim.gameEventLoggingEnabled = false
   scan.builder = initReplayPlayer(replay.data)
@@ -1290,7 +1398,8 @@ proc initReplayScan*(
   scan.builder.looping = false
   scan.builder.mismatchQuit = replay.mismatchQuit
   scan.maxTick = scan.builder.replayMaxTick()
-  replay.keyframes.add(scan.builder.saveReplayKeyframe(scan.sim))
+  if not replay.embeddedKeyframes:
+    replay.keyframes.add(scan.builder.saveReplayKeyframe(scan.sim, portable))
   scan.lastLead = scanTeamLead(scan.sim)
   replay.leadMetric = scanLeadMetric(scan.sim)
   scan.lastHeat = scanTeamHeat(scan.sim)
@@ -1388,9 +1497,11 @@ proc advanceReplayScan*(replay: var ReplayPlayer, maxTicks: int) =
       if event["k"].getStr() != "respawn":
         scan.beatTicks.add(scan.sim.tickCount)
         break
-    if scan.sim.tickCount mod scan.interval == 0 or
-        scan.sim.tickCount == scan.maxTick:
-      replay.keyframes.add(scan.builder.saveReplayKeyframe(scan.sim))
+    if not replay.embeddedKeyframes and (
+        scan.sim.tickCount mod scan.interval == 0 or
+        scan.sim.tickCount == scan.maxTick):
+      replay.keyframes.add(
+        scan.builder.saveReplayKeyframe(scan.sim, scan.portable))
     dec stepsLeft
   if scan.builder.playing and scan.sim.tickCount < scan.maxTick:
     return                              # more slices to come.
@@ -1436,12 +1547,13 @@ proc replayScanTicksPerFrame*(sim: SimServer): int =
 proc buildReplayKeyframes*(
   replay: var ReplayPlayer,
   initialSim: SimServer,
-  interval = ReplayKeyframeTicks
+  interval = ReplayKeyframeTicks,
+  portable = false
 ) =
   ## Runs the whole precompute walk synchronously (tests and offline tools;
   ## the hosted viewer advances it a slice per frame instead — see
   ## advanceReplayScan).
-  replay.initReplayScan(initialSim, interval)
+  replay.initReplayScan(initialSim, interval, portable)
   replay.advanceReplayScan(int.high)
 
 proc isLullTick*(replay: ReplayPlayer, tick: int): bool =
@@ -1661,3 +1773,50 @@ proc advanceReplayPlayback*(
 proc playbackSpeed*(speedIndex: int): int =
   ## Returns the live playback speed for an index.
   PlaybackSpeeds[clamp(speedIndex, 0, PlaybackSpeeds.high)]
+
+proc walkEmbeddedKeyframes*(
+  data: CtfReplayData,
+  interval = DefaultEmbeddedKeyframeTicks
+): EmbeddedKeyframeSet =
+  ## Walks one recorded match from tick 0 and returns its portable keyframes.
+  ## Assets resolve relative to the working directory (run from the repo
+  ## root or the image's /workspace, like every replay host).
+  var stripped = data
+  stripped.keyframeBlob = ""
+  var config = defaultGameConfig()
+  config.update(stripped.replay.configJson)
+  var sim = initSimServer(config)
+  sim.gameEventLoggingEnabled = false
+  var player = initReplayPlayer(stripped)
+  player.buildReplayKeyframes(sim, max(interval, 1), portable = true)
+  EmbeddedKeyframeSet(
+    version: EmbeddedKeyframeVersion,
+    interval: max(interval, 1),
+    gameVersion: GameVersion,
+    simStamp: ctfSimSourcesStamp,
+    keyframes: player.keyframes)
+
+proc embedReplayKeyframes*(
+  bytes: string,
+  interval = DefaultEmbeddedKeyframeTicks
+): string =
+  ## Spec 0157: returns the replay (uncompressed) with a keyframe trailer
+  ## built by walking it once from tick 0. The record stream is unchanged;
+  ## an existing trailer is replaced. Because the keyframes come from the
+  ## SAME deterministic walk the viewer would run, restoring one is
+  ## gameHash-identical to walking there from tick 0.
+  let body = replayRecordBytes(bytes, CtfReplaySpec)
+  let data = parseCtfReplayBytesFull(body)
+  appendKeyframeTrailer(
+    body, encodeEmbeddedKeyframes(walkEmbeddedKeyframes(data, interval)))
+
+proc embedReplayKeyframesFile*(
+  path: string,
+  interval = DefaultEmbeddedKeyframeTicks
+) =
+  ## Rewrites one replay file in place (via a temp file + rename) with
+  ## embedded keyframes.
+  let embedded = embedReplayKeyframes(readFile(path), interval)
+  let tmp = path & ".keyframes.tmp"
+  writeFile(tmp, embedded)
+  moveFile(tmp, path)

@@ -20,6 +20,10 @@ type
   CtfReplayData* = object
     replay*: ReplayData
     shell*: ShellReplayRecords
+    keyframeBlob*: string
+      ## The raw embedded-keyframe block (spec 0157), or "" for every replay
+      ## written without one. Opaque at this layer: replays.nim owns its
+      ## encoding (compressed, pointer-width-portable ReplayKeyframes).
 
   CtfReplayWriter* = object
     enabled*: bool
@@ -454,6 +458,60 @@ proc replayPayloadBytes(bytes: string, spec: ReplaySpec): string =
     return uncompress(bytes)
   bytes
 
+const
+  KeyframeTrailerMagic* = "CTFKEYF1"
+    ## Embedded replay keyframes (Metta spec 0157) ride AFTER the complete
+    ## record stream as a trailer:
+    ##
+    ##   <format-1 or format-2 replay bytes, unchanged>
+    ##   <keyframe block: N bytes>
+    ##   <u64 little-endian N>
+    ##   "CTFKEYF1"
+    ##
+    ## A trailer rather than a new record type because format 1 is parsed by
+    ## bitworld's generic codec and format 2 requires its manifest to be the
+    ## final record — neither can grow an in-stream record without changing a
+    ## parser this repo does not own. Readers that know the trailer strip it
+    ## before parsing, so the record stream (and its hashes and manifest
+    ## chains) is byte-for-byte what the live writer produced. Legacy replays
+    ## have no trailer and parse exactly as before. Readers OLDER than the
+    ## trailer reject a keyframed file ("Unknown replay record type"), which
+    ## is why embedding is opt-in.
+  KeyframeTrailerFooterLen = 16
+
+proc splitKeyframeTrailer*(payload: string): tuple[body, blob: string] =
+  ## Splits an uncompressed replay payload into its record stream and its
+  ## embedded keyframe block ("" when the payload carries none).
+  if payload.len < KeyframeTrailerFooterLen or
+      not payload.endsWith(KeyframeTrailerMagic):
+    return (payload, "")
+  var offset = payload.len - KeyframeTrailerFooterLen
+  var blobLen = 0'u64
+  for shift in countup(0, 56, 8):
+    blobLen = blobLen or (uint64(payload[offset].uint8) shl shift)
+    inc offset
+  let bodyEnd = uint64(payload.len - KeyframeTrailerFooterLen)
+  if blobLen > bodyEnd:
+    raise newException(ReplayError, "replay keyframe trailer is truncated")
+  let blobStart = int(bodyEnd - blobLen)
+  (payload[0 ..< blobStart],
+    payload[blobStart ..< payload.len - KeyframeTrailerFooterLen])
+
+proc appendKeyframeTrailer*(body, blob: string): string =
+  ## Appends one keyframe block to an uncompressed replay record stream that
+  ## carries no trailer yet.
+  result = body
+  result.add(blob)
+  let length = uint64(blob.len)
+  for shift in countup(0, 56, 8):
+    result.add(char(uint8((length shr shift) and 0xff'u64)))
+  result.add(KeyframeTrailerMagic)
+
+proc replayRecordBytes*(bytes: string, spec: ReplaySpec): string =
+  ## The uncompressed record stream of one replay file, without any embedded
+  ## keyframe trailer.
+  bytes.replayPayloadBytes(spec).splitKeyframeTrailer().body
+
 proc isCompatible(
   gameVersion: string,
   compatibleGameVersions: openArray[string]
@@ -792,7 +850,9 @@ proc parseCtfReplayBytes*(
   compatibleGameVersions: openArray[string]
 ): CtfReplayData =
   ## Parses one CTF replay and retains verified format-2 shell metadata.
-  let replayBytes = bytes.replayPayloadBytes(spec)
+  let (replayBytes, keyframeBlob) =
+    bytes.replayPayloadBytes(spec).splitKeyframeTrailer()
+  result.keyframeBlob = keyframeBlob
   var offset = 0
   let header = replayBytes.readHeader(
     spec,
