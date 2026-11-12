@@ -4,7 +4,8 @@
 import
   helpers,
   std/[json, os, unittest],
-  ctf/[broadcast, checkpoint, replay_runtime, replays, sim]
+  ctf/[broadcast, checkpoint, replay_codec, replay_runtime, replays, sim],
+  shell/replay_records
 
 const
   FixturePath = GameDir / "tests" / "fixtures" / "capture-seed1.bitreplay"
@@ -206,3 +207,88 @@ suite "game checkpoints":
     check manifest["game_version"].getStr == GameVersion
     check decodeGameSnapshot(readFile(tickDir / "game.snapshot")).tick == 300
     removeDir(dir)
+
+  test "snapshot config carries the episode seed and map, never tokens":
+    var player = initReplayPlayer(data)
+    var sim = inGameDir(proc (): SimServer = freshSim(data.replay.configJson))
+    player.runTo(sim, 300)
+    let snap = decodeGameSnapshot(encodeGameSnapshot(
+      captureGameSnapshot(player, sim)))
+    let config = snap.snapshotConfig()
+    check config.seed == sim.config.seed
+    check config.mapPath == sim.config.mapPath
+    for slot in config.slots:
+      check slot.token.len == 0
+    check checkpointAckTick("""{"type":"checkpoint_ack","tick":300}""") == 300
+    check checkpointAckTick("""{"type":"other","tick":300}""") == -1
+    check checkpointAckTick("not json") == -1
+    check parseJson(checkpointMessage(300)) ==
+      %*{"type": "checkpoint", "tick": 300, "deadline_ms": 2000}
+
+suite "replay writer continuation (live resume)":
+  ## A resumed server reopens its replay from the checkpoint's record prefix
+  ## and keeps writing. The resumed file must be byte-identical to the file an
+  ## uninterrupted writer produces from the same record sequence, so the
+  ## match has ONE replay whose hash chain and (format 2) manifest chains
+  ## span the restart.
+
+  proc firstHalf(writer: var CtfReplayWriter, shell: bool) =
+    writer.writeJoin(0, 0, "Player1", 0, "")
+    writer.writeJoin(0, 1, "Player2", 1, "")
+    writer.lastMasks = @[0'u8, 0'u8]
+    for tick in 1 .. 5:
+      writer.writeInputMaskChange(tickTime(tick - 1), tick mod 2,
+        uint8(tick))
+      writer.writeHash(uint32(tick), uint64(tick) * 7919'u64)
+    if shell:
+      writer.writeLobbyChat(LobbyChatRecord(replayTimeMs: tickTime(5),
+        ordinal: 1, seat: 0, team: 0, text: "gl"))
+      writer.writeHash(6, 6'u64 * 7919'u64)
+
+  proc secondHalf(writer: var CtfReplayWriter, shell: bool) =
+    for tick in 7 .. 12:
+      writer.writeInputMaskChange(tickTime(tick - 1), tick mod 2,
+        uint8(tick mod 3))
+      writer.writeHash(uint32(tick), uint64(tick) * 7919'u64)
+    if shell:
+      writer.writeLobbyChat(LobbyChatRecord(replayTimeMs: tickTime(12),
+        ordinal: 2, seat: 1, team: 1, text: "gg"))
+
+  proc roundTrip(shell: bool) =
+    let
+      base = getTempDir() / ("ctf-resume-" & $getCurrentProcessId() &
+        (if shell: "-f2" else: "-f1"))
+      straight = base & "-straight.bitreplay"
+      resumed = base & "-resumed.bitreplay"
+      configJson = if shell: """{"slots":[{"control":"play"},{"control":"play"}]}"""
+                   else: "{}"
+    var a = openReplayWriter(straight, configJson, CtfReplaySpec,
+      shellEpisode = shell, shellSeatCount = (if shell: 2 else: 0),
+      openedAtMs = 1'u64)
+    a.firstHalf(shell)
+    a.flushReplayWriter()
+    let prefix = readFile(straight)
+    let masks = a.lastMasks
+    a.secondHalf(shell)
+    a.closeReplayWriter()
+    var b = resumeReplayWriter(resumed, prefix, CtfReplaySpec,
+      ReplayCompatibleGameVersions, masks)
+    check b.enabled
+    check b.shellEpisode == shell
+    check b.lastMasks == masks
+    b.secondHalf(shell)
+    b.closeReplayWriter()
+    check readFile(resumed) == readFile(straight)
+    let parsed = parseCtfReplayBytesFull(readFile(resumed))
+    check parsed.replay.hashes.len == (if shell: 12 else: 11)
+    if shell:
+      check parsed.shell.manifestVerified
+      check parsed.shell.lobbyTranscript.len == 2
+    removeFile(straight)
+    removeFile(resumed)
+
+  test "format 1 (bitworld records) continues byte-identically":
+    roundTrip(shell = false)
+
+  test "format 2 continues byte-identically with a verified manifest":
+    roundTrip(shell = true)

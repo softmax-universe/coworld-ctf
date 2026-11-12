@@ -224,6 +224,58 @@ class PlaySeat:
         self.statuses: list[dict] = []
         self.chat: list[dict] = []
         self.last_view_tick = 0
+        # Coworld Checkpoints (Metta spec 0157; PLAYER.md "Checkpoints").
+        # Subclasses add their own fields via checkpoint_state() /
+        # restore_checkpoint_state(); this base keeps the per-episode id
+        # floors, without which a respawned process restarts its ids at 1
+        # and has every upload/call refused as stale.
+        self.restored_state: dict | None = None
+        self.load_checkpoint_state()
+
+    # ── seat state ────────────────────────────────────────────────────────
+
+    def checkpoint_state(self) -> dict:
+        return {"version": 1, "next_upload_id": self.next_upload_id,
+                "next_proposal_id": self.next_proposal_id}
+
+    def restore_checkpoint_state(self, state: dict) -> None:
+        self.next_upload_id = max(self.next_upload_id, int(state.get("next_upload_id", 1)))
+        self.next_proposal_id = max(self.next_proposal_id, int(state.get("next_proposal_id", 1)))
+
+    def load_checkpoint_state(self) -> None:
+        path = os.environ.get("COWORLD_PLAYER_STATE_IN", "")
+        if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return
+        with open(path, encoding="utf-8") as source:
+            state = json.load(source)
+        if state.get("version") != 1:
+            log(f"seat state {path}: unknown version, starting fresh")
+            return
+        self.restore_checkpoint_state(state)
+        self.restored_state = state
+        log(f"seat state restored from {path}: {json.dumps(state, sort_keys=True)[:200]}")
+
+    def save_checkpoint_state(self, tick: int | None) -> None:
+        path = os.environ.get("COWORLD_PLAYER_STATE_OUT", "")
+        if not path:
+            return
+        temporary = f"{path}.tmp"
+        with open(temporary, "w", encoding="utf-8") as sink:
+            json.dump({**self.checkpoint_state(), "tick": tick}, sink)
+        os.replace(temporary, path)
+
+    def _on_text(self, message: str) -> None:
+        """TEXT frames carry only the checkpoint handshake; save, then ack."""
+        try:
+            prompt = json.loads(message)
+        except ValueError:
+            return
+        if not isinstance(prompt, dict) or prompt.get("type") != "checkpoint":
+            return
+        tick = prompt.get("tick")
+        self.save_checkpoint_state(tick)
+        self.connection.send(json.dumps({"type": "checkpoint_ack", "tick": tick}))
+        log(f"checkpoint tick={tick}: state saved, acknowledged")
 
     def send(self, payload: bytes) -> None:
         self.connection.send(payload)
@@ -254,7 +306,10 @@ class PlaySeat:
             except TimeoutError:
                 return
             if isinstance(message, str):
-                continue  # the legacy Sprite stream also lands on this socket
+                # The checkpoint handshake (TEXT frames); the legacy Sprite
+                # stream's text also lands here and is ignored.
+                self._on_text(message)
+                continue
             packet = wire.decode_server_packet(message)
             if packet is None:
                 continue

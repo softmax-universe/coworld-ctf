@@ -5,6 +5,7 @@ import
 
 var
   runtimeLoaded = false
+  pendingSeekTick = -1
   replay: ReplayPlayer
   game: SimServer
   viewer: GlobalViewerState
@@ -227,9 +228,12 @@ proc ctfFrame(): cint {.exportc: "ctf_frame", cdecl.} =
     return 0
   stampStage(frameStage)
   try:
-    let seekTicks =
+    var seekTicks =
       if viewer.replaySeekTick >= 0: @[viewer.replaySeekTick]
       else: newSeq[int]()
+    if pendingSeekTick >= 0:
+      seekTicks = @[pendingSeekTick]
+      pendingSeekTick = -1
     let events = replay.advanceReplayFrame(
       game,
       tracker,
@@ -257,6 +261,22 @@ proc ctfMismatchTick(): cint {.exportc: "ctf_mismatch_tick", cdecl.} =
     cint(replay.hashMismatchTick)
   else:
     -1
+
+# Coworld Checkpoints (spec 0157) diagnostics, used by
+# tools/checkpoints/wasm_keyframe_smoke.cjs: how many keyframes the loaded
+# replay EMBEDDED (0 when it carried none, or they were rejected), a
+# programmatic seek consumed by the next ctf_frame, and the current tick.
+proc ctfEmbeddedKeyframes(): cint {.exportc: "ctf_embedded_keyframes", cdecl.} =
+  if runtimeLoaded and replay.embeddedKeyframes:
+    cint(replay.keyframes.len)
+  else:
+    0
+
+proc ctfSeek(tick: cint) {.exportc: "ctf_seek", cdecl.} =
+  pendingSeekTick = int(tick)
+
+proc ctfTick(): cint {.exportc: "ctf_tick", cdecl.} =
+  if runtimeLoaded: cint(game.tickCount) else: -1
 
 proc ctfErrorPointer(): ptr uint8 {.exportc: "ctf_error_ptr", cdecl.} =
   if lastError.len == 0:
