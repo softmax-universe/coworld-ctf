@@ -158,6 +158,14 @@ for the background `initReplayScan` walk.
   which checks hash parity over the whole match, including the resumed half.
   `tools/checkpoints/snapshot_diff.nim` checks that a snapshot equals the sim
   that a replay walk reaches at the same tick.
+- The rebuilt wasm32 bundle (`static-replay-viewer/`) decodes all 35
+  embedded keyframes of `capture-seed1` (embedded with
+  `tools/checkpoints/embed_keyframes.nim`). A first-frame seek to tick 1234,
+  and one to tick 6400, each land exactly on the target and play to the end
+  (tick 6663) with no hash mismatch (`wasm_keyframe_smoke.cjs`). Without a
+  trailer, the smoke script reports 0 keyframes and fails as designed.
+  `tools/wasm_replay_smoke.cjs` still passes on every committed fixture
+  except `gen-colossal-4team`, whose OOM is already known (b2295cf0).
 - A Docker run used Metta's Stage 1 runner (`coworld run-episode`, branch
   `sasmith/coworld-checkpoints`), with
   `tools/checkpoints/make_e2e_manifest.py` and a player image that includes a

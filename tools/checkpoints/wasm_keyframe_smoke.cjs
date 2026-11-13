@@ -81,9 +81,14 @@ function run() {
   let frames = 0;
   let previous = landed;
   let stalled = 0;
+  let wrapped = false;
   while (Module._ctf_frame() === 1 && frames < 200000) {
     frames++;
     const now = Module._ctf_tick();
+    if (now < previous) { // the viewer loops back to the start after the end hold
+      wrapped = true;
+      break;
+    }
     if (now === previous) {
       if (++stalled > 600) break; // paused at the end hold
     } else {
@@ -99,14 +104,14 @@ function run() {
     console.error('FAIL: hash mismatch at tick ' + Module._ctf_mismatch_tick() + ' after the seek');
     process.exit(1);
   }
-  const finalTick = Module._ctf_tick();
+  const finalTick = wrapped ? previous : Module._ctf_tick();
   if (finalTick <= landed) {
     console.error('FAIL: playback did not advance past the seek (tick ' + finalTick + ')');
     process.exit(1);
   }
   clearTimeout(watchdog);
   console.log('ok: played ' + frames + ' frames from tick ' + landed + ' to tick ' + finalTick +
-    ' with no hash mismatch');
+    ' with no hash mismatch' + (wrapped ? ' (reached the end; the viewer then loops)' : ''));
   process.exit(0);
 }
 
