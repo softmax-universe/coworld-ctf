@@ -32,6 +32,7 @@ import
   test_quad_mirror,
   test_replay,
   test_replay_scan,
+  test_coworld_checkpoints,
   test_shot_exposure,
   test_shell_dispatch,
   test_shell_seats,

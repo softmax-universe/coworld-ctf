@@ -212,6 +212,12 @@ type
     controlContext: JsonNode  ## parsed 0xB0 "control" payload
     view: JsonNode            ## parsed latest non-empty 0xB1 "view" payload
     statuses: seq[JsonNode]
+    # --- seat state (Coworld Checkpoints, PLAYER.md "Checkpoints") -------
+    uploaded: bool            ## the playbook upload pass has run
+    readyCount: int
+    standingPayload: string   ## the last ladder the server accepted
+    restores: int             ## how many times this seat resumed from state
+    checkpoints: int          ## checkpoint prompts answered
 
 proc jsonU64(n: JsonNode): uint64 =
   ## u64 identities (upload/proposal/status ordinals) ride the wire as
@@ -256,6 +262,87 @@ proc pump(seat: var S2Seat) =
     seat.ackMark = seat.highestOrdinal
     seat.ws.send(encodeStatusAck(seat.ackMark), BinaryMessage)
 
+# ── seat state: Coworld Checkpoints (Metta spec 0157) ─────────────────────
+#
+# What a restarted process needs to carry on as if it had never died: the
+# upload/proposal id floors (the server refuses an id at or below one it
+# already admitted, so a fresh process restarting at 1 has its calls
+# refused as stale), whether the playbook is already installed (a
+# re-upload of identical bytes under an admitted id is silently idempotent,
+# so a fresh process would wait out the upload deadline per module), and
+# the standing ladder. Status ordinals are NOT saved: they are connection
+# bookkeeping, and a new connection is redelivered whatever it has not
+# acknowledged.
+
+const SeatStateVersion = 1
+
+proc stateJson(seat: S2Seat, tick: int): JsonNode =
+  %*{
+    "version": SeatStateVersion,
+    "policy": "baseline/s2play",
+    "slot": seat.slot,
+    "tick": tick,
+    "uploaded": seat.uploaded,
+    "ready_count": seat.readyCount,
+    "next_upload_id": $seat.nextUploadId,
+    "next_proposal_id": $seat.nextProposalId,
+    "standing_ladder": seat.standingPayload,
+    "restores": seat.restores,
+    "checkpoints": seat.checkpoints
+  }
+
+proc saveSeatState(seat: S2Seat, tick: int) =
+  ## Writes COWORLD_PLAYER_STATE_OUT atomically (temp file + rename), so a
+  ## SIGKILL never leaves a torn file. BASELINE_DISCARD_STATE=1 skips the
+  ## write (acknowledging anyway) to demonstrate mid-episode amnesia.
+  let path = getEnv("COWORLD_PLAYER_STATE_OUT")
+  if path.len == 0 or getEnv("BASELINE_DISCARD_STATE") == "1":
+    return
+  let tmp = path & ".tmp"
+  writeFile(tmp, $seat.stateJson(tick))
+  moveFile(tmp, path)
+
+proc loadSeatState(seat: var S2Seat) =
+  ## Restores COWORLD_PLAYER_STATE_IN when it names a non-empty file.
+  let path = getEnv("COWORLD_PLAYER_STATE_IN")
+  if path.len == 0 or not fileExists(path) or getFileSize(path) == 0:
+    return
+  let node = parseJson(readFile(path))
+  if node{"version"}.getInt(0) != SeatStateVersion:
+    echo "s2 seat state: unknown version in ", path, ", starting fresh"
+    return
+  seat.uploaded = node{"uploaded"}.getBool(false)
+  seat.readyCount = node{"ready_count"}.getInt(0)
+  seat.nextUploadId = max(seat.nextUploadId, jsonU64(node{"next_upload_id"}))
+  seat.nextProposalId = max(seat.nextProposalId,
+    jsonU64(node{"next_proposal_id"}))
+  seat.standingPayload = node{"standing_ladder"}.getStr("")
+  seat.checkpoints = node{"checkpoints"}.getInt(0)
+  seat.restores = node{"restores"}.getInt(0) + 1
+  echo "s2 seat state restored from ", path, ": tick=",
+    node{"tick"}.getInt(-1), " uploaded=", seat.uploaded,
+    " next_upload_id=", seat.nextUploadId,
+    " next_proposal_id=", seat.nextProposalId,
+    " restores=", seat.restores
+
+proc handleText(seat: var S2Seat, data: string) =
+  ## TEXT frames carry the checkpoint handshake (the play-seat protocol
+  ## itself is binary-only): save, then acknowledge within the 2 s budget.
+  var node: JsonNode
+  try:
+    node = parseJson(data)
+  except CatchableError:
+    return
+  if node.kind != JObject or node{"type"}.getStr("") != "checkpoint":
+    return
+  let tick = node{"tick"}.getInt(-1)
+  inc seat.checkpoints
+  seat.saveSeatState(tick)
+  seat.ws.send($(%*{"type": "checkpoint_ack", "tick": tick}), TextMessage)
+  echo "s2 checkpoint tick=", tick, " saved=",
+    getEnv("COWORLD_PLAYER_STATE_OUT").len > 0 and
+      getEnv("BASELINE_DISCARD_STATE") != "1"
+
 proc drainOnce(seat: var S2Seat, timeoutMs: int) =
   ## Reads at most one websocket message. A Ping is answered with Pong (the
   ## one non-shell byte this client ever sends); anything that is not a
@@ -269,7 +356,9 @@ proc drainOnce(seat: var S2Seat, timeoutMs: int) =
     seat.ws.send(msg.get.data, Pong)
   of BinaryMessage:
     seat.file(decodeServerPacket(msg.get.data))
-  of TextMessage, Pong:
+  of TextMessage:
+    seat.handleText(msg.get.data)
+  of Pong:
     discard
 
 proc drain(seat: var S2Seat, seconds: float) =
@@ -365,25 +454,33 @@ proc runS2Session*(ws: WebSocket, slot: int, firstMessage: Message) =
   ## way the SAME outer connect/retry/quit-on-gameover handler in
   ## `baseline.nim`'s `runBot` covers both protocols.
   var seat = initS2Seat(ws, slot)
+  seat.loadSeatState()
   seat.file(decodeServerPacket(firstMessage.data))
   if seat.context.isNil:
     raise newException(S2WireError, "PlayContext did not parse")
   echo "baseline slot=", slot, " season2Shell=true -> play seat"
 
-  let playbook = loadPlaybook()
-  var readyCount = 0
-  for (name, blob) in playbook:
-    if seat.upload(name, blob):
-      inc readyCount
-  echo "s2 playbook: ", readyCount, "/", playbook.len, " modules ready"
+  if seat.uploaded:
+    # Restored: the server still holds (or, after a game restore, has
+    # re-installed) this seat's playbook and standing ladder.
+    echo "s2 playbook: restored, ", seat.readyCount,
+      " modules already ready; skipping upload"
+  else:
+    let playbook = loadPlaybook()
+    for (name, blob) in playbook:
+      if seat.upload(name, blob):
+        inc seat.readyCount
+    seat.uploaded = true
+    echo "s2 playbook: ", seat.readyCount, "/", playbook.len, " modules ready"
 
-  var standingPayload = encodeLadder(buildLadder(seat.view, seat.context))
-  discard seat.call(standingPayload, "opening call")
+  if seat.standingPayload.len == 0:
+    seat.standingPayload = encodeLadder(buildLadder(seat.view, seat.context))
+    discard seat.call(seat.standingPayload, "opening call")
 
   while true:
     seat.pump()
     seat.drain(0.5)
     let payload = encodeLadder(buildLadder(seat.view, seat.context))
-    if payload != standingPayload:
+    if payload != seat.standingPayload:
       if seat.call(payload, "maintenance"):
-        standingPayload = payload
+        seat.standingPayload = payload

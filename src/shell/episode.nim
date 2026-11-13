@@ -949,6 +949,41 @@ when ShellRuntimeAvailable:
       config: DemoPlayConfig): seq[string] =
     episode.configureDemoPlayWithReplayIdentities(config).lines
 
+  proc restorePlaySeat*(episode: var ShellEpisode; seat: int;
+      uploads: openArray[tuple[uploadId: uint64, wasm: string]];
+      callNumber, callProposalId: uint64; callBytes: string;
+      tick: uint32): seq[string] =
+    ## Spec 0157 checkpoint restore of one play seat: re-admits every module
+    ## the seat had admitted (same upload ids, same bytes), compiles them
+    ## synchronously, and re-accepts the standing call under its original
+    ## call number. Runs at boot, before tick T + 1 steps; nothing here is
+    ## recorded into the replay (the restored prefix already holds it).
+    if not episode.enabled:
+      result.add "SHELL_RESTORE seat=" & $seat & " skipped=episode_disabled"
+      return
+    episode.ensureRuntime()
+    for upload in uploads:
+      # One upload per compile tick, as live admission spaces them.
+      episode.compilePlane.beginTick()
+      let admitted = episode.admitPlayModule(seat, upload.uploadId, 0,
+        upload.wasm.rawBytes)
+      result.add(&"SHELL_RESTORE_UPLOAD seat={seat} upload_id={upload.uploadId} " &
+        &"accepted={admitted.accepted} reason={admitted.reason}")
+    if uploads.len > 0 and not episode.compilePlane.drainCompileWorkers():
+      result.add(&"SHELL_RESTORE_COMPILE seat={seat} drained=false")
+    while true:
+      let batch = episode.commitReadyModules()
+      if batch.len == 0:
+        break
+      for commit in batch:
+        result.add(&"SHELL_RESTORE_COMMIT seat={commit.seat} " &
+          &"upload_id={commit.uploadId} terminal={commit.terminal}")
+    if callBytes.len > 0 and callNumber > 0:
+      episode.ladder.primeCallNumber(seat, callNumber - 1)
+      let accepted = episode.acceptPlayCall(seat, callProposalId, 0, tick,
+        callBytes)
+      result.add(&"SHELL_RESTORE_CALL seat={seat} accepted={accepted.accepted} " &
+        &"call_number={accepted.callNumber} reason={accepted.reason}")
 else:
   proc shellRecovery*(episode: ShellEpisode; seatIndex: int):
       tuple[callNumber: uint64, call: Option[PlayContextAcceptedCall],
@@ -995,6 +1030,17 @@ else:
       episode: var ShellEpisode;
       config: DemoPlayConfig): DemoPlayConfigResult =
     result.lines = episode.configureDemoPlay(config)
+
+  proc restorePlaySeat*(episode: var ShellEpisode; seat: int;
+      uploads: openArray[tuple[uploadId: uint64, wasm: string]];
+      callNumber, callProposalId: uint64; callBytes: string;
+      tick: uint32): seq[string] =
+    discard uploads
+    discard callNumber
+    discard callProposalId
+    discard callBytes
+    discard tick
+    @["SHELL_RESTORE seat=" & $seat & " skipped=runtime_unavailable"]
 
 proc configureDemoPlayFromJsonWithReplayIdentities*(
     episode: var ShellEpisode; configJson: string;

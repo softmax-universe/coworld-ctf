@@ -319,6 +319,16 @@ proc seatCallNumber*(driver: LadderDriver; seatIndex: int): uint64 =
     return 0
   driver.seats[seatIndex].callNumber
 
+proc primeCallNumber*(driver: LadderDriver; seatIndex: int;
+                      callNumber: uint64) =
+  ## Spec 0157 restore: the next accepted call on a still-empty seat takes
+  ## `callNumber + 1`, so a re-accepted standing call keeps the number the
+  ## restored replay prefix recorded for it.
+  if driver == nil or seatIndex < 0 or seatIndex >= driver.seats.len:
+    return
+  if driver.seats[seatIndex].callNumber == 0:
+    driver.seats[seatIndex].callNumber = callNumber
+
 proc callSnapshot*(driver: LadderDriver; seatIndex: int):
     Option[LadderCallSnapshot] =
   if driver == nil or seatIndex < 0 or seatIndex >= driver.seats.len or

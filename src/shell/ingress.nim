@@ -108,6 +108,34 @@ proc initPlayIngressSeat*[Socket](): PlayIngressSeat[Socket] =
   result.uploadPayloads = initTable[uint64, string]()
   result.callPayloads = initTable[uint64, string]()
 
+proc uploadHistory*[Socket](seat: PlayIngressSeat[Socket]):
+    seq[tuple[uploadId: uint64, wasm: string]] =
+  ## Every upload this seat had admitted, in upload-id order (spec 0157).
+  for uploadId, wasm in seat.uploadPayloads:
+    result.add((uploadId, wasm))
+  for i in 1 ..< result.len:
+    var j = i
+    while j > 0 and result[j - 1].uploadId > result[j].uploadId:
+      swap(result[j - 1], result[j])
+      dec j
+
+proc restoreUploadHistory*[Socket](seat: var PlayIngressSeat[Socket];
+    uploads: openArray[tuple[uploadId: uint64, wasm: string]];
+    admittedModules: int; admittedUploadBytes: uint64;
+    hasUploadIdFloor: bool; uploadIdFloor: uint64;
+    hasProposalIdFloor: bool; proposalIdFloor: uint64) =
+  ## Spec 0157 restore: reinstates the per-episode admission history, so a
+  ## restored seat keeps its budgets and id floors and an identical
+  ## re-upload stays idempotent exactly as it would have in the original.
+  for upload in uploads:
+    seat.uploadPayloads[upload.uploadId] = upload.wasm
+  seat.admittedModules = admittedModules
+  seat.admittedUploadBytes = admittedUploadBytes
+  seat.hasUploadIdFloor = hasUploadIdFloor
+  seat.uploadIdFloor = uploadIdFloor
+  seat.hasProposalIdFloor = hasProposalIdFloor
+  seat.proposalIdFloor = proposalIdFloor
+
 proc inspectPlayMessage*[Socket](
   seat: var PlayIngressSeat[Socket],
   socket: Socket,

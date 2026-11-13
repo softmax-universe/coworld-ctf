@@ -20,11 +20,19 @@ type
   CtfReplayData* = object
     replay*: ReplayData
     shell*: ShellReplayRecords
+    keyframeBlob*: string
+      ## The raw embedded-keyframe block (spec 0157), or "" for every replay
+      ## written without one. Opaque at this layer: replays.nim owns its
+      ## encoding (compressed, pointer-width-portable ReplayKeyframes).
 
   CtfReplayWriter* = object
     enabled*: bool
     shellEpisode*: bool
     lastMasks*: seq[uint8]
+    rawLegacy: bool
+      ## A RESUMED format-1 writer (spec 0157): bitworld's writer cannot
+      ## append to an existing file, so the resumed stream is written here,
+      ## byte-identically to bitworld's own record encoders.
     legacyWriter: replayCodec.ReplayWriter
     file: File
     callRecords: seq[seq[string]]
@@ -94,6 +102,16 @@ proc writeTimed(writer: var CtfReplayWriter, time: uint32, phase: uint8,
   writer.pendingTimedRecords.add(PendingTimedRecord(
     phase: phase, ordinal: writer.pendingOrdinal, bytes: move(bytes)))
   inc writer.pendingOrdinal
+
+proc emitTimed(writer: var CtfReplayWriter, time: uint32, phase: uint8,
+    bytes: sink string) =
+  if writer.rawLegacy:
+    writer.file.write(bytes)
+  else:
+    writer.writeTimed(time, phase, bytes)
+
+proc usesBitworld(writer: CtfReplayWriter): bool =
+  not writer.shellEpisode and not writer.rawLegacy
 
 proc ensureSeatBucket(writer: var CtfReplayWriter, seat: uint8) =
   if int(seat) >= writer.callRecords.len:
@@ -169,7 +187,7 @@ proc writeJoin*(writer: var CtfReplayWriter, time: uint32, player: int,
                 name: string, slot: int, token: string) =
   if not writer.enabled:
     return
-  if not writer.shellEpisode:
+  if writer.usesBitworld:
     replayCodec.writeJoin(writer.legacyWriter, time, player, name, slot, token)
     return
   if name.len > high(uint16).int or token.len > high(uint16).int:
@@ -188,13 +206,13 @@ proc writeJoin*(writer: var CtfReplayWriter, time: uint32, player: int,
   bytes.add(char(uint8(token.len and 0xff)))
   bytes.add(char(uint8(token.len shr 8)))
   bytes.add(token)
-  writer.writeTimed(time, 0, move(bytes))
+  writer.emitTimed(time, 0, move(bytes))
 
 proc writeJoin*(writer: var CtfReplayWriter, time: uint32, player: int,
                 address: string) =
   if not writer.enabled:
     return
-  if not writer.shellEpisode:
+  if writer.usesBitworld:
     replayCodec.writeJoin(writer.legacyWriter, time, player, address)
     return
   if address.len > high(uint16).int:
@@ -207,12 +225,12 @@ proc writeJoin*(writer: var CtfReplayWriter, time: uint32, player: int,
   bytes.add(char(uint8(address.len and 0xff)))
   bytes.add(char(uint8(address.len shr 8)))
   bytes.add(address)
-  writer.writeTimed(time, 0, move(bytes))
+  writer.emitTimed(time, 0, move(bytes))
 
 proc writeLeave*(writer: var CtfReplayWriter, time: uint32, player: int) =
   if not writer.enabled:
     return
-  if not writer.shellEpisode:
+  if writer.usesBitworld:
     replayCodec.writeLeave(writer.legacyWriter, time, player)
     return
   var bytes = ""
@@ -220,12 +238,12 @@ proc writeLeave*(writer: var CtfReplayWriter, time: uint32, player: int) =
   for shift in countup(0, 24, 8):
     bytes.add(char(uint8((time shr shift) and 0xff'u32)))
   bytes.add(char(uint8(player)))
-  writer.writeTimed(time, 0, move(bytes))
+  writer.emitTimed(time, 0, move(bytes))
 
 proc writeInput*(writer: var CtfReplayWriter, input: ReplayInput) =
   if not writer.enabled:
     return
-  if not writer.shellEpisode:
+  if writer.usesBitworld:
     replayCodec.writeInput(writer.legacyWriter, input)
     return
   var bytes = ""
@@ -234,13 +252,13 @@ proc writeInput*(writer: var CtfReplayWriter, input: ReplayInput) =
     bytes.add(char(uint8((input.time shr shift) and 0xff'u32)))
   bytes.add(char(input.player))
   bytes.add(char(input.keys))
-  writer.writeTimed(input.time, 2, move(bytes))
+  writer.emitTimed(input.time, 2, move(bytes))
 
 proc writeChat*(writer: var CtfReplayWriter, time: uint32, player: int,
                 message: string) =
   if not writer.enabled:
     return
-  if not writer.shellEpisode:
+  if writer.usesBitworld:
     replayCodec.writeChat(writer.legacyWriter, time, player, message)
     return
   if message.len > high(uint16).int:
@@ -253,13 +271,13 @@ proc writeChat*(writer: var CtfReplayWriter, time: uint32, player: int,
   bytes.add(char(uint8(message.len and 0xff)))
   bytes.add(char(uint8(message.len shr 8)))
   bytes.add(message)
-  writer.writeTimed(time, 2, move(bytes))
+  writer.emitTimed(time, 2, move(bytes))
 
 proc writeDebugSprite*(writer: var CtfReplayWriter, time: uint32,
                        player: int, packet: openArray[uint8]) =
   if not writer.enabled:
     return
-  if not writer.shellEpisode:
+  if writer.usesBitworld:
     replayCodec.writeDebugSprite(writer.legacyWriter, time, player, packet)
     return
   if uint64(packet.len) > uint64(high(uint32)):
@@ -274,17 +292,18 @@ proc writeDebugSprite*(writer: var CtfReplayWriter, time: uint32,
     bytes.add(char(uint8((length shr shift) and 0xff'u32)))
   for value in packet:
     bytes.add(char(value))
-  writer.writeTimed(time, 2, move(bytes))
+  writer.emitTimed(time, 2, move(bytes))
 
 proc writeHash*(writer: var CtfReplayWriter, tick: uint32, hash: uint64) =
   if not writer.enabled:
     return
-  if not writer.shellEpisode:
+  if writer.usesBitworld:
     replayCodec.writeHash(writer.legacyWriter, tick, hash)
     return
   if writer.manifestWritten:
     raise newException(ReplayError, "shell replay manifest is already final")
-  writer.flushTimedRecords()
+  if not writer.rawLegacy:
+    writer.flushTimedRecords()
   writer.file.writeU8(ReplayTickHashRecord)
   writer.file.writeU32(tick)
   writer.file.writeU64(hash)
@@ -356,6 +375,8 @@ proc flushReplayWriter*(writer: var CtfReplayWriter) =
   if writer.shellEpisode:
     writer.flushTimedRecords()
     writer.file.flushFile()
+  elif writer.rawLegacy:
+    writer.file.flushFile()
   else:
     replayCodec.flushReplayWriter(writer.legacyWriter)
 
@@ -365,6 +386,21 @@ proc closeReplayWriter*(writer: var CtfReplayWriter) =
   if writer.shellEpisode:
     writer.writeManifest()
     writer.file.flushFile()
+    writer.file.close()
+  elif writer.rawLegacy:
+    writer.file.flushFile()
+    writer.file.close()
+  else:
+    replayCodec.closeReplayWriter(writer.legacyWriter)
+  writer.enabled = false
+
+proc abandonReplayWriter*(writer: var CtfReplayWriter) =
+  ## Closes the file WITHOUT finalizing it (no format-2 manifest). Used when
+  ## a resumed server replaces the writer it opened at boot with one that
+  ## continues a checkpoint's record stream (spec 0157).
+  if not writer.enabled:
+    return
+  if writer.shellEpisode or writer.rawLegacy:
     writer.file.close()
   else:
     replayCodec.closeReplayWriter(writer.legacyWriter)
@@ -453,6 +489,60 @@ proc replayPayloadBytes(bytes: string, spec: ReplaySpec): string =
   if spec.allowCompressed and bytes.isCompressedReplayBytes():
     return uncompress(bytes)
   bytes
+
+const
+  KeyframeTrailerMagic* = "CTFKEYF1"
+    ## Embedded replay keyframes (Metta spec 0157) ride AFTER the complete
+    ## record stream as a trailer:
+    ##
+    ##   <format-1 or format-2 replay bytes, unchanged>
+    ##   <keyframe block: N bytes>
+    ##   <u64 little-endian N>
+    ##   "CTFKEYF1"
+    ##
+    ## A trailer rather than a new record type because format 1 is parsed by
+    ## bitworld's generic codec and format 2 requires its manifest to be the
+    ## final record — neither can grow an in-stream record without changing a
+    ## parser this repo does not own. Readers that know the trailer strip it
+    ## before parsing, so the record stream (and its hashes and manifest
+    ## chains) is byte-for-byte what the live writer produced. Legacy replays
+    ## have no trailer and parse exactly as before. Readers OLDER than the
+    ## trailer reject a keyframed file ("Unknown replay record type"), which
+    ## is why embedding is opt-in.
+  KeyframeTrailerFooterLen = 16
+
+proc splitKeyframeTrailer*(payload: string): tuple[body, blob: string] =
+  ## Splits an uncompressed replay payload into its record stream and its
+  ## embedded keyframe block ("" when the payload carries none).
+  if payload.len < KeyframeTrailerFooterLen or
+      not payload.endsWith(KeyframeTrailerMagic):
+    return (payload, "")
+  var offset = payload.len - KeyframeTrailerFooterLen
+  var blobLen = 0'u64
+  for shift in countup(0, 56, 8):
+    blobLen = blobLen or (uint64(payload[offset].uint8) shl shift)
+    inc offset
+  let bodyEnd = uint64(payload.len - KeyframeTrailerFooterLen)
+  if blobLen > bodyEnd:
+    raise newException(ReplayError, "replay keyframe trailer is truncated")
+  let blobStart = int(bodyEnd - blobLen)
+  (payload[0 ..< blobStart],
+    payload[blobStart ..< payload.len - KeyframeTrailerFooterLen])
+
+proc appendKeyframeTrailer*(body, blob: string): string =
+  ## Appends one keyframe block to an uncompressed replay record stream that
+  ## carries no trailer yet.
+  result = body
+  result.add(blob)
+  let length = uint64(blob.len)
+  for shift in countup(0, 56, 8):
+    result.add(char(uint8((length shr shift) and 0xff'u64)))
+  result.add(KeyframeTrailerMagic)
+
+proc replayRecordBytes*(bytes: string, spec: ReplaySpec): string =
+  ## The uncompressed record stream of one replay file, without any embedded
+  ## keyframe trailer.
+  bytes.replayPayloadBytes(spec).splitKeyframeTrailer().body
 
 proc isCompatible(
   gameVersion: string,
@@ -575,11 +665,21 @@ proc verifyManifest(
     raise newException(ReplayError,
       "lobby transcript manifest verification failed")
 
+type
+  ShellRecordBuckets* = object
+    ## The manifest-arm'd record bytes of a format-2 record stream, in file
+    ## order, as the writer accumulates them (spec 0157 live resume).
+    calls*: seq[tuple[seat: uint8, bytes: string]]
+    annotations*: seq[tuple[seat: uint8, bytes: string]]
+    transcript*: seq[string]
+
 proc parseFormat2Records(
   replayBytes: string,
   offset: var int,
   spec: ReplaySpec,
   result: var CtfReplayData,
+  buckets: var ShellRecordBuckets,
+  requireManifest = true,
 ) =
   let configuredPlaySeats = result.replay.configJson.playSeatsFromConfig()
   var
@@ -783,8 +883,14 @@ proc parseFormat2Records(
       raise newException(ReplayError, error.msg)
     except LifecycleRecordError as error:
       raise newException(ReplayError, "invalid lifecycle record: " & error.msg)
-  if sawShellRecord and not sawManifest:
+  if requireManifest and sawShellRecord and not sawManifest:
     raise newException(ReplayError, "shell replay manifest is missing")
+  if not requireManifest and sawManifest:
+    raise newException(ReplayError,
+      "replay prefix already carries its final manifest")
+  buckets.calls = move(callBytes)
+  buckets.annotations = move(annotationBytes)
+  buckets.transcript = move(transcriptBytes)
 
 proc parseCtfReplayBytes*(
   bytes: string,
@@ -792,7 +898,9 @@ proc parseCtfReplayBytes*(
   compatibleGameVersions: openArray[string]
 ): CtfReplayData =
   ## Parses one CTF replay and retains verified format-2 shell metadata.
-  let replayBytes = bytes.replayPayloadBytes(spec)
+  let (replayBytes, keyframeBlob) =
+    bytes.replayPayloadBytes(spec).splitKeyframeTrailer()
+  result.keyframeBlob = keyframeBlob
   var offset = 0
   let header = replayBytes.readHeader(
     spec,
@@ -814,7 +922,8 @@ proc parseCtfReplayBytes*(
     return
 
   result.replay = header.data
-  replayBytes.parseFormat2Records(offset, spec, result)
+  var buckets: ShellRecordBuckets
+  replayBytes.parseFormat2Records(offset, spec, result, buckets)
 
 proc parseReplayBytes*(
   bytes: string,
@@ -839,3 +948,52 @@ proc loadCtfReplay*(
   compatibleGameVersions: openArray[string]
 ): CtfReplayData =
   parseCtfReplayBytes(readFile(path), spec, compatibleGameVersions)
+
+proc resumeReplayWriter*(
+  path: string,
+  prefix: string,
+  spec: ReplaySpec,
+  compatibleGameVersions: openArray[string],
+  lastMasks: seq[uint8],
+): CtfReplayWriter =
+  ## Spec 0157 live resume: reopens `path` as a writer that CONTINUES the
+  ## record stream `prefix` (a checkpoint's `replayRecords`: header plus
+  ## records, flushed at a tick boundary, no manifest, no keyframe trailer).
+  ## The prefix is written back verbatim, so the resumed match yields ONE
+  ## replay whose hash chain spans the restart. For format 2 the
+  ## manifest-arm'd call/annotation/transcript bytes are re-fed from the
+  ## prefix, so the final manifest's chains cover the whole match.
+  ## `lastMasks` is the boot writer's input-dedupe state at the checkpoint
+  ## (the writer records a mask only when it changes, so it must continue
+  ## from the same state).
+  if path.len == 0 or prefix.len == 0:
+    return
+  var offset = 0
+  let header = prefix.readHeader(spec, compatibleGameVersions, offset)
+  if header.formatVersion == 1'u16:
+    result.rawLegacy = true
+  else:
+    result.shellEpisode = true
+    var
+      parsed = CtfReplayData(replay: header.data)
+      buckets: ShellRecordBuckets
+    prefix.parseFormat2Records(offset, spec, parsed, buckets,
+      requireManifest = false)
+    let seatCount = header.data.configJson.playSeatsFromConfig().len
+    result.callRecords = newSeq[seq[string]](seatCount)
+    result.annotationRecords = newSeq[seq[string]](seatCount)
+    for item in buckets.calls:
+      if int(item.seat) >= seatCount:
+        raise newException(ReplayError, "play-call seat is out of range")
+      result.callRecords[int(item.seat)].add(item.bytes)
+    for item in buckets.annotations:
+      if int(item.seat) >= seatCount:
+        raise newException(ReplayError, "annotation seat is out of range")
+      result.annotationRecords[int(item.seat)].add(item.bytes)
+    result.transcriptRecords = buckets.transcript
+  if not open(result.file, path, fmWrite):
+    raise newException(IOError, "Could not open replay file: " & path)
+  result.file.write(prefix)
+  result.file.flushFile()
+  result.enabled = true
+  result.lastMasks = lastMasks
